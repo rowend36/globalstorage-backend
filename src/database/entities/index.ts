@@ -30,3 +30,17 @@ export {
   createAuditEventSchema,
   type AuditEvent,
 } from './audit.schema';
+export {
+  SpaceSchema,
+  type Space,
+  SpaceKeySchema,
+  type SpaceKey,
+  SpaceBlockSchema,
+  type SpaceBlock,
+  SpaceDictionarySchema,
+  type SpaceDictionary,
+  type DictionaryEntries,
+  type DictionaryEntry,
+  type SpaceState,
+  type SpaceBlockState,
+} from './space.schema';
