@@ -1,5 +1,6 @@
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import {
+  ConflictException,
   Inject,
   Injectable,
   NotFoundException,
@@ -67,6 +68,55 @@ export class AuthService {
     return user;
   }
 
+  /**
+   * Self-service registration. Creates the user plus a personal tenant that
+   * carries the 'none' MFA policy, so password login issues tokens directly.
+   * The personal tenant is invisible to the product surface; spaces are owned
+   * by the user directly.
+   */
+  async register(
+    email: string,
+    password: string,
+    name?: string,
+  ): Promise<{ user: User; tokens: TokenPair }> {
+    const normalizedEmail = email.trim().toLowerCase();
+    const existing = await this.em.findOne(UserSchema, {
+      email: normalizedEmail,
+      deletedAt: null,
+    });
+    if (existing) throw new ConflictException('Email already registered');
+
+    const { user, tenantId } = await this.em.transactional(async (transactionalEm) => {
+      const slug = `personal-${randomBytes(5).toString('hex')}`;
+      const tenant = transactionalEm.create(TenantSchema, {
+        slug,
+        name: 'Personal',
+        path: slug,
+        mfaPolicy: 'none',
+        parent: null,
+        deletedAt: null,
+      });
+      const user = transactionalEm.create(UserSchema, {
+        email: normalizedEmail,
+        passwordHash: await argon2.hash(password),
+        roleVersion: 1,
+        deletedAt: null,
+        name: name?.trim() || null,
+        totpSecret: null,
+      });
+      transactionalEm.create(TenantMembershipSchema, {
+        user,
+        tenant,
+        includeDescendants: false,
+        deletedAt: null,
+      });
+      await transactionalEm.flush();
+      return { user, tenantId: tenant.id };
+    });
+    const tokens = await this.login(user, tenantId);
+    return { user, tokens };
+  }
+
   async mfaMethodsForUser(
     user: User,
     tenantSlug?: string,
@@ -107,6 +157,7 @@ export class AuthService {
       tenantId = memberships[0]?.tenant.id;
       policy = memberships[0]?.tenant.mfaPolicy ?? 'any';
     }
+    if (policy === 'none') return { methods: [], tenantId };
     if (policy === 'totp' && !user.totpSecret) return { methods: [], setupRequired: 'totp', tenantId };
     if (policy === 'totp') return { methods: ['totp'], tenantId };
     if (policy === 'email') return { methods: ['email'], tenantId };

@@ -2,7 +2,7 @@ import { defineEntity, type InferEntity, p } from '@mikro-orm/core';
 import { uuid } from './helpers';
 import { UserSchema } from './user.schema';
 
-export type TenantMfaPolicy = 'any' | 'totp' | 'email';
+export type TenantMfaPolicy = 'none' | 'any' | 'totp' | 'email';
 
 export const TenantSchema = defineEntity({
   name: 'Tenant',

@@ -190,22 +190,14 @@
       "checks": [],
       "triggers": [
         {
-          "name": "audit_events_immutable_delete",
+          "name": "audit_events_immutable",
           "timing": "before",
           "events": [
+            "update",
             "delete"
           ],
           "forEach": "row",
-          "body": "SELECT RAISE(ABORT, 'audit_events are immutable');"
-        },
-        {
-          "name": "audit_events_immutable_update",
-          "timing": "before",
-          "events": [
-            "update"
-          ],
-          "forEach": "row",
-          "body": "SELECT RAISE(ABORT, 'audit_events are immutable');"
+          "body": "SELECT RAISE(ABORT, 'audit_events are immutable')"
         }
       ],
       "foreignKeys": {},

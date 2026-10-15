@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Get,
   Post,
   Req,
   Res,
@@ -50,6 +51,15 @@ class LoginDto {
   @IsOptional() @IsString() tenant?: string;
   @ApiPropertyOptional({ default: false })
   @IsOptional() @IsBoolean() cookies: boolean = false;
+}
+
+class RegisterDto {
+  @ApiProperty({ example: 'user@example.com' })
+  @IsEmail() email!: string;
+  @ApiProperty({ minLength: 8, format: 'password' })
+  @IsString() @MinLength(8) password!: string;
+  @ApiPropertyOptional({ example: 'Ada' })
+  @IsOptional() @IsString() name?: string;
 }
 
 class RefreshDto {
@@ -122,6 +132,13 @@ class TokenPairResponse {
   @ApiProperty() refreshToken!: string;
 }
 
+class UserResponse {
+  @ApiProperty() id!: string;
+  @ApiProperty({ example: 'user@example.com' }) email!: string;
+  @ApiProperty({ example: 'Ada', nullable: true }) name!: string | null;
+  @ApiProperty({ example: 1 }) roleVersion!: number;
+}
+
 class CookiesResponse {
   @ApiProperty() cookies!: boolean;
 }
@@ -163,6 +180,7 @@ class TotpSetupResponse {
   LoginTenantResponse,
   MfaChallengeResponse,
   TenantOptionResponse,
+  UserResponse,
 )
 export class AuthController {
   constructor(
@@ -171,6 +189,45 @@ export class AuthController {
     private readonly config: ConfigService<AppConfig, true>,
     private readonly audit: AuditService,
   ) {}
+
+  @Post('register')
+  @ApiOperation({ summary: 'Create a user account and receive tokens' })
+  @ApiBody({ type: RegisterDto })
+  @ApiOkResponse({ type: TokenPairResponse })
+  async register(@Body() dto: RegisterDto) {
+    const { user, tokens } = await this.auth.register(
+      dto.email,
+      dto.password,
+      dto.name,
+    );
+    await this.audit.record({
+      tenantId: null,
+      actorId: user.id,
+      action: 'auth.register',
+      recordType: 'User',
+      recordId: user.id,
+      before: {},
+      after: { method: 'password' },
+      requestId: requestContext.getCorrelationId(),
+    });
+    return tokens;
+  }
+
+  @Get('me')
+  @UseGuards(AuthGuard('jwt'))
+  @ApiBearerAuth()
+  @ApiCookieAuth()
+  @ApiOperation({ summary: 'Get the authenticated user' })
+  @ApiOkResponse({ type: UserResponse })
+  async me(@Req() request: Request & { user: CurrentUser }) {
+    const user = await this.auth.getUserById(request.user.sub);
+    return {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      roleVersion: user.roleVersion,
+    };
+  }
 
   @Post('login')
   @ApiOperation({ summary: 'Log in with email and password' })
