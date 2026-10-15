@@ -8,7 +8,10 @@ import {
   PayloadTooLargeException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { EntityManager, LockMode } from '@mikro-orm/core';
+import { EntityManager, LockMode, raw, type EntityName } from '@mikro-orm/core';
+// Type-only: erased at runtime. The injected base EM is a SQL EM at
+// runtime; the cast is how we reach the query builder.
+import type { SqlEntityManager } from '@mikro-orm/sql';
 import {
   SpaceKeySchema,
   SpaceSchema,
@@ -361,12 +364,11 @@ export class StorageEngineService {
     const space = await this.loadSpace(ownerId, spaceId);
     const [keyCount, pending] = await Promise.all([
       this.em.count(SpaceKeySchema, { space: space.id, deletedAt: null }),
-      this.raw<Array<{ keys: number | string; bytes: number | string }>>(
-        this.em,
-        'select count(*) as keys, coalesce(sum(length(value)), 0) as bytes ' +
-          'from space_keys where space_id = ? and version > last_persisted_version',
-        [space.id],
-      ),
+      this.sql(this.em, SpaceKeySchema)
+        .select([raw('count(*) as keys'), raw('coalesce(sum(length(value)), 0) as bytes')])
+        .where({ space: space.id })
+        .andWhere('version > last_persisted_version')
+        .execute('all') as Promise<Array<{ keys: number | string; bytes: number | string }>>,
     ]);
     const row = pending[0];
     return {
@@ -386,22 +388,20 @@ export class StorageEngineService {
   // owner check): only our own worker calls these, never the API layer.
 
   async listDirtyKeys(spaceId: string, limit = DIRTY_LIST_LIMIT): Promise<DirtyKey[]> {
-    const rows = await this.raw<
-      Array<{
-        id: string;
-        key: string;
-        version: number | string;
-        value: Buffer;
-        content_type: string | null;
-        deleted_at: unknown;
-      }>
-    >(
-      this.em,
-      'select id, key, version, value, content_type, deleted_at from space_keys ' +
-        'where space_id = ? and version > last_persisted_version ' +
-        'order by key asc limit ?',
-      [spaceId, limit],
-    );
+    const rows = (await this.sql(this.em, SpaceKeySchema)
+      .select([raw('id, key, version, value, content_type, deleted_at')])
+      .where({ space: spaceId })
+      .andWhere('version > last_persisted_version')
+      .orderBy({ key: 'ASC' })
+      .limit(limit)
+      .execute('all')) as Array<{
+      id: string;
+      key: string;
+      version: number | string;
+      value: Buffer;
+      content_type: string | null;
+      deleted_at: unknown;
+    }>;
     return rows.map((row) => ({
       id: row.id,
       key: row.key,
@@ -413,13 +413,10 @@ export class StorageEngineService {
   }
 
   async listKeyVersions(spaceId: string): Promise<KeyVersionInfo[]> {
-    const rows = await this.raw<
-      Array<{ key: string; version: number | string; deleted_at: unknown }>
-    >(
-      this.em,
-      'select key, version, deleted_at from space_keys where space_id = ?',
-      [spaceId],
-    );
+    const rows = (await this.sql(this.em, SpaceKeySchema)
+      .select([raw('key, version, deleted_at')])
+      .where({ space: spaceId })
+      .execute('all')) as Array<{ key: string; version: number | string; deleted_at: unknown }>;
     return rows.map((row) => ({
       key: row.key,
       version: Number(row.version),
@@ -517,12 +514,13 @@ export class StorageEngineService {
   // ---------------------------------------------------------------- helpers
 
   /**
-   * Context-aware raw SQL. `getConnection().execute()` without the
-   * transaction context grabs a second pool connection and deadlocks
-   * single-connection drivers (sqlite) when called inside a transaction.
+   * QueryBuilder bound to this EM — transaction-aware when given a
+   * transactional EM. Aggregates and column-to-column predicates are
+   * expressed as string/embedded-raw fragments: object-where syntax
+   * cannot represent `SUM()` or `version > last_persisted_version`.
    */
-  private raw<T>(em: EntityManager, sql: string, params: unknown[]): Promise<T> {
-    return em.getConnection().execute(sql, params, 'all', em.getTransactionContext()) as Promise<T>;
+  private sql<T extends object>(em: EntityManager, entity: EntityName<T>) {
+    return (em as SqlEntityManager).createQueryBuilder(entity);
   }
 
   private toSpaceSummary(space: Space): SpaceSummary {
@@ -573,12 +571,11 @@ export class StorageEngineService {
     // Aggregate caps usage, not the sum of per-space quotas. Checked
     // inside the transaction; concurrent writes across *different* spaces
     // can still transiently overshoot — accepted residual for Stage 1.
-    const rows = await this.raw<Array<{ total: number | string }>>(
-      tx,
-      'select coalesce(sum(used_bytes), 0) as total from spaces where owner_id = ?',
-      [ownerId],
-    );
-    if (Number(rows[0]?.total ?? 0) + delta > aggregateQuotaBytes) {
+    const row = (await this.sql(tx, SpaceSchema)
+      .select([raw('coalesce(sum(used_bytes), 0) as total')])
+      .where({ owner: ownerId })
+      .execute('get')) as { total: number | string } | undefined;
+    if (Number(row?.total ?? 0) + delta > aggregateQuotaBytes) {
       throw new QuotaExceededException('aggregate');
     }
   }
