@@ -11,8 +11,6 @@ import {
   PasswordResetTokenSchema,
   RefreshTokenSchema,
   RoleSchema,
-  SpaceBlockSchema,
-  SpaceDictionarySchema,
   SpaceKeySchema,
   SpaceSchema,
   TenantMembershipSchema,
@@ -48,8 +46,6 @@ export const mikroOrmOptions = (config: Pick<AppConfig, 'database'>) => ({
     AuditEventSchema,
     SpaceSchema,
     SpaceKeySchema,
-    SpaceBlockSchema,
-    SpaceDictionarySchema,
   ] as any[],
   extensions: [Migrator, SchemaGenerator],
   migrations: {

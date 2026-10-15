@@ -6,7 +6,7 @@ import { AppModule } from './../src/app.module';
 import { configureApplication } from '../src/bootstrap';
 import { MikroORM } from '@mikro-orm/core';
 import * as argon2 from 'argon2';
-import { UserSchema } from '../src/database/entities/schemas';
+import { UserSchema, TenantSchema, TenantMembershipSchema } from '../src/database/entities/schemas';
 
 describe('authentication (e2e)', () => {
   let app: INestApplication<App>;
@@ -30,7 +30,23 @@ describe('authentication (e2e)', () => {
     orm = moduleFixture.get(MikroORM);
     await orm.schema.create();
     const em = orm.em.fork();
-    em.create(UserSchema, { email, passwordHash: await argon2.hash(password) });
+    // Mirror register(): a personal tenant with the 'none' MFA policy plus
+    // a membership, so password login issues tokens without an MFA step.
+    const tenant = em.create(TenantSchema, {
+      slug: 'personal-e2e',
+      name: 'Personal',
+      path: 'personal-e2e',
+      mfaPolicy: 'none',
+      parent: null,
+      deletedAt: null,
+    });
+    const user = em.create(UserSchema, { email, passwordHash: await argon2.hash(password) });
+    em.create(TenantMembershipSchema, {
+      user,
+      tenant,
+      includeDescendants: false,
+      deletedAt: null,
+    });
     await em.flush();
   });
 

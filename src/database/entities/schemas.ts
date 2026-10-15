@@ -23,8 +23,4 @@ export {
   type Space,
   SpaceKeySchema,
   type SpaceKey,
-  SpaceBlockSchema,
-  type SpaceBlock,
-  SpaceDictionarySchema,
-  type SpaceDictionary,
 } from './index';

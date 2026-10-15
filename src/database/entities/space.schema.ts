@@ -3,14 +3,6 @@ import { uuid } from './helpers';
 import { UserSchema } from './user.schema';
 
 export type SpaceState = 'active' | 'unhealthy';
-export type SpaceBlockState = 'active' | 'retired';
-
-export interface DictionaryEntry {
-  blockId: string;
-  keyVersion: number;
-}
-
-export type DictionaryEntries = Record<string, DictionaryEntry>;
 
 export const SpaceSchema = defineEntity({
   name: 'Space',
@@ -49,34 +41,3 @@ export const SpaceKeySchema = defineEntity({
   },
 });
 export type SpaceKey = InferEntity<typeof SpaceKeySchema>;
-
-export const SpaceBlockSchema = defineEntity({
-  name: 'SpaceBlock',
-  tableName: 'space_blocks',
-  indexes: [{ properties: ['space'] }],
-  properties: {
-    id: uuid(),
-    space: () => p.manyToOne(SpaceSchema),
-    generation: p.integer().default(1),
-    sizeBytes: p.integer().default(0),
-    checksum: p.string(),
-    payload: p.blob(),
-    state: p.string().default<SpaceBlockState>('active'),
-    createdAt: p.datetime().onCreate(() => new Date()),
-  },
-});
-export type SpaceBlock = InferEntity<typeof SpaceBlockSchema>;
-
-export const SpaceDictionarySchema = defineEntity({
-  name: 'SpaceDictionary',
-  tableName: 'space_dictionaries',
-  properties: {
-    id: uuid(),
-    space: () => p.manyToOne(SpaceSchema).unique(),
-    version: p.integer().default(0),
-    entries: p.json().$type<DictionaryEntries>(),
-    checksum: p.string().nullable(),
-    updatedAt: p.datetime().onUpdate(() => new Date()).nullable(),
-  },
-});
-export type SpaceDictionary = InferEntity<typeof SpaceDictionarySchema>;
