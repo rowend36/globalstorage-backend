@@ -1,0 +1,39 @@
+services:
+  mailserver:
+    image: docker.io/mailserver/docker-mailserver:latest
+    hostname: ${MAIL_HOST:?MAIL_HOST is required}
+    env_file:
+      - .env
+    environment:
+      ENABLE_IMAP: 0
+      ENABLE_POP3: 0
+      ENABLE_CLAMAV: 0
+      ENABLE_FAIL2BAN: 0
+      ENABLE_RSPAMD: 0
+      ENABLE_OPENDKIM: 1
+      ENABLE_OPENDMARC: 1
+      PERMIT_DOCKER: none
+      SSL_TYPE: letsencrypt
+    volumes:
+      - ./data/mail-config:/tmp/docker-mailserver
+      - mail_data:/var/mail
+      - mail_state:/var/mail-state
+      - mail_logs:/var/log/mail
+      - ./data/letsencrypt:/etc/letsencrypt:ro
+    networks:
+      mail:
+        aliases: [mailserver, "${MAIL_HOST:?MAIL_HOST is required}"]
+    healthcheck:
+      test: ["CMD-SHELL", "ss -lnt | grep -q ':587 '"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mail_data:
+  mail_state:
+  mail_logs:
+
+networks:
+  mail:
+    name: globalstorage-mail

@@ -1,0 +1,33 @@
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./data/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./data/certbot-webroot:/var/www/certbot:ro
+      - ./data/letsencrypt:/etc/letsencrypt:ro
+      - production_uploads:/var/www/uploads/production:ro
+      - preview_uploads:/var/www/uploads/preview:ro
+    networks:
+      gateway:
+
+  certbot:
+    image: certbot/certbot:v4.0.0
+    profiles: [tools]
+    command: ["renew", "--webroot", "-w", "/var/www/certbot"]
+    volumes:
+      - ./data/certbot-webroot:/var/www/certbot
+      - ./data/letsencrypt:/etc/letsencrypt
+
+networks:
+  gateway:
+    external: true
+    name: globalstorage-gateway
+
+volumes:
+  production_uploads:
+    name: globalstorage-backend_production_uploads
+  preview_uploads:
+    name: globalstorage-backend_preview_uploads

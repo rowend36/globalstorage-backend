@@ -1,0 +1,12 @@
+.git
+.github
+node_modules
+dist
+coverage
+data
+backups
+.env
+.env.*
+!.env.example
+Dockerfile
+compose*.yml

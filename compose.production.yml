@@ -1,0 +1,78 @@
+services:
+  production-api:
+    image: ${PRODUCTION_IMAGE:?PRODUCTION_IMAGE is required}
+    env_file:
+      - .env
+      - .env.production
+    environment:
+      NODE_ENV: production
+      DATABASE_DRIVER: postgresql
+      DB_HOST: production-postgres
+      DB_PORT: 5432
+      REDIS_URL: redis://production-redis:6379
+      QUEUE_REDIS_URL: redis://production-redis:6379
+      SMTP_URL: smtp://${SMTP_USER}:${SMTP_PASSWORD}@${MAIL_HOST}:587
+      PORT: 3000
+    expose:
+      - "3000"
+    volumes:
+      - production_uploads:/app/uploads
+    networks:
+      app: {}
+      gateway:
+        aliases: [production-api]
+      mail:
+        aliases: [production-api]
+    depends_on:
+      production-postgres:
+        condition: service_healthy
+      production-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/v1/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  production-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME:-globalstorage_prod}
+      POSTGRES_USER: ${DB_USER:-globalstorage}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    volumes:
+      - production_postgres:/var/lib/postgresql/data
+    networks: [app]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  production-redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - production_redis:/data
+    networks: [app]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  production_uploads:
+    name: globalstorage-backend_production_uploads
+  production_postgres:
+  production_redis:
+
+networks:
+  app:
+  gateway:
+    external: true
+    name: globalstorage-gateway
+  mail:
+    external: true
+    name: globalstorage-mail
