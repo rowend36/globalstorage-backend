@@ -2,6 +2,7 @@ import { BadRequestException } from '@nestjs/common';
 
 export const MAX_KEY_LENGTH = 512;
 
+// eslint-disable-next-line no-control-regex -- detecting control chars is the point
 const CONTROL_CHARS = /[\u0000-\u001F\u007F]/;
 
 /**

@@ -1127,6 +1127,23 @@
           "enumItems": [],
           "mappedType": "datetime"
         },
+        "deleted_at": {
+          "name": "deleted_at",
+          "type": "datetime",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
         "id": {
           "name": "id",
           "type": "text",
@@ -1163,7 +1180,7 @@
         },
         "last_persisted_version": {
           "name": "last_persisted_version",
-          "type": "integer",
+          "type": "bigint",
           "unsigned": false,
           "autoincrement": false,
           "primary": false,
@@ -1172,11 +1189,11 @@
           "length": null,
           "precision": null,
           "scale": null,
-          "default": "0",
+          "default": "'0'",
           "comment": null,
           "collation": null,
           "enumItems": [],
-          "mappedType": "integer"
+          "mappedType": "bigint"
         },
         "space_id": {
           "name": "space_id",
@@ -1231,7 +1248,7 @@
         },
         "version": {
           "name": "version",
-          "type": "integer",
+          "type": "bigint",
           "unsigned": false,
           "autoincrement": false,
           "primary": false,
@@ -1240,11 +1257,11 @@
           "length": null,
           "precision": null,
           "scale": null,
-          "default": "1",
+          "default": "'1'",
           "comment": null,
           "collation": null,
           "enumItems": [],
-          "mappedType": "integer"
+          "mappedType": "bigint"
         }
       },
       "indexes": [

@@ -14,11 +14,14 @@ export class QuotaExceededException extends ForbiddenException {
 }
 
 export class KeyVersionConflictException extends PreconditionFailedException {
-  constructor(currentVersion: number) {
+  constructor(currentVersion: number | null) {
     super({
       code: 'version_conflict',
       currentVersion,
-      message: `Key version mismatch; current version is ${currentVersion}`,
+      message:
+        currentVersion === null
+          ? 'Key does not exist'
+          : `Key version mismatch; current version is ${currentVersion}`,
     });
   }
 }

@@ -198,6 +198,16 @@ export const configuration = () => {
         'local',
       ),
       directory: process.env.PERSISTENCE_DIRECTORY ?? 'data/provider',
+      flushDebounceMs: number(
+        'PERSISTENCE_FLUSH_DEBOUNCE_MS',
+        process.env.PERSISTENCE_FLUSH_DEBOUNCE_MS,
+        1000,
+      ),
+      syncCooldownMs: number(
+        'PERSISTENCE_SYNC_COOLDOWN_MS',
+        process.env.PERSISTENCE_SYNC_COOLDOWN_MS,
+        5000,
+      ),
     },
     mail: {
       provider: choice(

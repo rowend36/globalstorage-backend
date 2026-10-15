@@ -1,0 +1,37 @@
+/**
+ * Engine ports. The operational engine never touches the storage medium
+ * directly; the flush worker (Phase 3) implements these against adapters.
+ * Until a provider is registered, the engine degrades gracefully: writes
+ * still commit locally and stay pending, pre-locking is skipped.
+ */
+
+/** Implemented by the flush worker: drain dirty keys for spaces. */
+export const FLUSH_HANDLER = Symbol('FlushHandler');
+
+export interface FlushHandler {
+  handle(spaceIds: string[]): Promise<void>;
+}
+
+/**
+ * Best-effort block locking for the write-path pre-lock. Locks live on
+ * the storage medium (adapter lock resources), so other Global Storage
+ * instances can see them. Held pre-locks are consumed by the flush
+ * worker, which owns their release.
+ */
+export const BLOCK_LOCKS = Symbol('BlockLocks');
+
+export interface BlockLockPort {
+  /** Resolve a key to its current block via the dictionary, if known. */
+  locateKeyBlock(spaceId: string, key: string): Promise<string | null>;
+  /**
+   * Acquire the block lock. Returns the fencing token on success,
+   * null when the block is already locked (caller proceeds anyway).
+   */
+  tryAcquire(
+    spaceId: string,
+    blockId: string,
+    owner: string,
+    leaseMs: number,
+  ): Promise<string | null>;
+  release(spaceId: string, blockId: string, owner: string): Promise<void>;
+}

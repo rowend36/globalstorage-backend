@@ -25,6 +25,7 @@ import {
 } from './infrastructure/rate-limit.port';
 import { OidcModule } from './oidc/oidc.module';
 import { JobsModule } from './jobs/jobs.module';
+import { EngineModule } from './engine/engine.module';
 import { LoggerModule } from 'nestjs-pino';
 import pino, { type TransportTargetOptions } from 'pino';
 import { join } from 'node:path';
@@ -166,6 +167,7 @@ LoggerModule.forRootAsync({
     HealthModule,
     JobsModule.register(),
     ObservabilityModule,
+    EngineModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })
