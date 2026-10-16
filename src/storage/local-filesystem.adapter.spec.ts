@@ -41,6 +41,16 @@ describe('LocalFilesystemAdapter', () => {
     ).rejects.toBeInstanceOf(StorageConflictError);
   });
 
+  it('lists resources under a prefix', async () => {
+    expect(await adapter.list('sp_1', '')).toEqual([]);
+    await adapter.write('sp_1', 'blocks/b1', Buffer.from('1'));
+    await adapter.write('sp_1', 'blocks/b2', Buffer.from('2'));
+    await adapter.write('sp_1', 'dictionary', Buffer.from('d'));
+    expect(await adapter.list('sp_1', '')).toEqual(['blocks/b1', 'blocks/b2', 'dictionary']);
+    expect(await adapter.list('sp_1', 'blocks')).toEqual(['b1', 'b2']);
+    expect(await adapter.list('missing', '')).toEqual([]);
+  });
+
   it('refuses path traversal and advertises capabilities', async () => {
     await expect(adapter.read('..', 'dictionary')).rejects.toThrow();
     await expect(adapter.read('sp_1', '../other')).rejects.toThrow();

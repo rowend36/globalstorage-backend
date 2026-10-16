@@ -107,7 +107,10 @@ function canonical(body: unknown): string {
 }
 
 function withChecksum<T extends object>(body: T): T & { checksum: string } {
-  return { ...body, checksum: sha256Hex(canonical(body)) };
+  // Strip any incoming checksum first: parse → mutate → serialize must
+  // round-trip, so the checksum always covers the body alone.
+  const { checksum: _ignored, ...rest } = body as Record<string, unknown>;
+  return { ...rest, checksum: sha256Hex(canonical(rest)) } as T & { checksum: string };
 }
 
 function parseFormat(raw: unknown, kinds: string[]): string {

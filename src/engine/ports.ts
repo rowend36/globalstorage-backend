@@ -9,7 +9,13 @@
 export const FLUSH_HANDLER = Symbol('FlushHandler');
 
 export interface FlushHandler {
-  handle(spaceIds: string[]): Promise<void>;
+  /**
+   * Flush the given spaces. Returns the ids still needing a flush
+   * (lock contention etc.) — the scheduler retains and retries them.
+   * Throwing retains the whole batch. Never blocks: busy resources are
+   * reported, not waited on.
+   */
+  handle(spaceIds: string[]): Promise<string[]>;
 }
 
 /**

@@ -6,12 +6,23 @@ import {
   NotFoundException,
   Optional,
   PayloadTooLargeException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { EntityManager, LockMode, raw, type EntityName } from '@mikro-orm/core';
 // Type-only: erased at runtime. The injected base EM is a SQL EM at
 // runtime; the cast is how we reach the query builder.
 import type { SqlEntityManager } from '@mikro-orm/sql';
+import {
+  STORAGE_ADAPTER,
+  type StorageAdapter,
+} from '../storage/storage-adapter.port';
+import { DictionaryCache } from '../storage/dictionary-cache';
+import {
+  StorageVersionError,
+  parseBlock,
+  parseDictionary,
+} from '../storage/formats';
 import {
   SpaceKeySchema,
   SpaceSchema,
@@ -39,6 +50,7 @@ export interface SpaceSummary {
   usedBytes: number;
   state: string;
   providerType: string;
+  providerConfig: Record<string, unknown> | null;
 }
 
 export interface WriteKeyInput {
@@ -147,6 +159,8 @@ export class StorageEngineService {
     private readonly config: ConfigService<AppConfig, true>,
     private readonly scheduler: FlushScheduler,
     @Optional() @Inject(BLOCK_LOCKS) private readonly locks?: BlockLockPort,
+    @Optional() @Inject(STORAGE_ADAPTER) private readonly storage?: StorageAdapter,
+    @Optional() private readonly dictionaryCache?: DictionaryCache,
   ) {}
 
   // ---------------------------------------------------------------- spaces
@@ -221,6 +235,12 @@ export class StorageEngineService {
     await this.em.nativeUpdate(SpaceSchema, { id: spaceId }, { state });
   }
 
+  /** Space-scoped lookup for the flush worker (null when rows are gone). */
+  async getSpace(spaceId: string): Promise<SpaceSummary | null> {
+    const space = await this.em.findOne(SpaceSchema, { id: spaceId });
+    return space ? this.toSpaceSummary(space) : null;
+  }
+
   // ------------------------------------------------------------------ keys
 
   async writeKey(input: WriteKeyInput): Promise<WriteKeyResult> {
@@ -283,14 +303,87 @@ export class StorageEngineService {
   }): Promise<ReadKeyResult> {
     const space = await this.loadSpace(input.ownerId, input.spaceId);
     const row = await this.em.findOne(SpaceKeySchema, { space: space.id, key: input.key });
-    if (!row || row.deletedAt) throw new NotFoundException('Key not found');
-    // Hydrate-on-miss from the medium is wired in Phase 3 (needs the
-    // adapter). A present row is always authoritative for reads.
+    if (row && !row.deletedAt) {
+      // A present row is always authoritative for reads.
+      return {
+        value: Buffer.from(row.value),
+        contentType: row.contentType ?? null,
+        version: row.version,
+        updatedAt: row.updatedAt ?? null,
+      };
+    }
+    // Tombstones read as deleted without consulting the medium
+    // (read-your-deletes); the flush reconciles concurrent medium writes.
+    if (row) throw new NotFoundException('Key not found');
+    if (!this.storage || !this.dictionaryCache) throw new NotFoundException('Key not found');
+    return this.hydrateFromMedium(space.id, input.key);
+  }
+
+  /**
+   * Read-miss hydration: the key is absent locally but may live on the
+   * medium (another instance wrote it, or our rows were rebuilt). Pulls
+   * the envelope into a persisted row. Genuine 404 only when the key is
+   * in neither place; anything inconsistent fails explicitly (503).
+   */
+  private async hydrateFromMedium(spaceId: string, key: string): Promise<ReadKeyResult> {
+    const storage = this.storage;
+    const cache = this.dictionaryCache;
+    if (!storage || !cache) throw new NotFoundException('Key not found');
+    let cached = cache.get(spaceId);
+    if (!cached) {
+      const rawDictionary = await storage.read(spaceId, 'dictionary');
+      if (!rawDictionary) throw new NotFoundException('Key not found');
+      try {
+        cache.set(spaceId, parseDictionary(rawDictionary));
+      } catch (error) {
+        if (error instanceof StorageVersionError) {
+          await this.setSpaceState(spaceId, 'unhealthy');
+          throw new ServiceUnavailableException('Stored data uses a newer format version');
+        }
+        throw new NotFoundException('Key not found');
+      }
+      cached = cache.get(spaceId);
+      if (!cached) throw new NotFoundException('Key not found');
+    }
+    const entry = cached.dictionary.entries[key];
+    if (!entry) throw new NotFoundException('Key not found');
+    const blockRaw = await storage.read(spaceId, `blocks/${entry.blockId}`);
+    if (!blockRaw) throw new ServiceUnavailableException('Key data unavailable');
+    let envelope;
+    try {
+      envelope = parseBlock(blockRaw).entries[key];
+    } catch (error) {
+      if (error instanceof StorageVersionError) {
+        await this.setSpaceState(spaceId, 'unhealthy');
+        throw new ServiceUnavailableException('Stored data uses a newer format version');
+      }
+      throw new ServiceUnavailableException('Key data unavailable');
+    }
+    if (!envelope || envelope.keyVersion !== entry.keyVersion) {
+      throw new ServiceUnavailableException('Key data unavailable');
+    }
+    const pulled = {
+      value: Buffer.from(envelope.value, 'base64'),
+      version: envelope.keyVersion,
+      contentType: envelope.contentType,
+    };
+    const { applied } = await this.upsertFromMedium(spaceId, key, pulled);
+    if (!applied) {
+      // A concurrent local write landed meanwhile; serve the newer row.
+      const current = await this.em.findOne(SpaceKeySchema, { space: spaceId, key });
+      if (!current || current.deletedAt) throw new NotFoundException('Key not found');
+      return {
+        value: Buffer.from(current.value),
+        contentType: current.contentType ?? null,
+        version: current.version,
+        updatedAt: current.updatedAt ?? null,
+      };
+    }
     return {
-      value: Buffer.from(row.value),
-      contentType: row.contentType ?? null,
-      version: row.version,
-      updatedAt: row.updatedAt ?? null,
+      value: pulled.value,
+      contentType: pulled.contentType,
+      version: pulled.version,
+      updatedAt: new Date(pulled.version),
     };
   }
 
@@ -399,16 +492,16 @@ export class StorageEngineService {
       key: string;
       version: number | string;
       value: Buffer;
-      content_type: string | null;
-      deleted_at: unknown;
+      contentType: string | null;
+      deletedAt: unknown;
     }>;
     return rows.map((row) => ({
       id: row.id,
       key: row.key,
       version: Number(row.version),
       value: Buffer.from(row.value),
-      contentType: row.content_type,
-      deleted: row.deleted_at != null,
+      contentType: row.contentType,
+      deleted: row.deletedAt != null,
     }));
   }
 
@@ -416,12 +509,47 @@ export class StorageEngineService {
     const rows = (await this.sql(this.em, SpaceKeySchema, 'k')
       .select(['k.key', 'k.version', 'k.deletedAt'])
       .where({ space: spaceId })
-      .execute('all')) as Array<{ key: string; version: number | string; deleted_at: unknown }>;
+      .execute('all')) as Array<{ key: string; version: number | string; deletedAt: unknown }>;
     return rows.map((row) => ({
       key: row.key,
       version: Number(row.version),
-      deleted: row.deleted_at != null,
+      deleted: row.deletedAt != null,
     }));
+  }
+
+  /** Live rows for a key set (missing-block rebuild input). Chunked. */
+  async getKeyEntries(
+    spaceId: string,
+    keys: string[],
+  ): Promise<Array<{ key: string; value: Buffer; version: number; contentType: string | null }>> {
+    const out: Array<{ key: string; value: Buffer; version: number; contentType: string | null }> = [];
+    for (let index = 0; index < keys.length; index += 500) {
+      const batch = keys.slice(index, index + 500);
+      if (batch.length === 0) continue;
+      const rows = await this.em.find(SpaceKeySchema, {
+        space: spaceId,
+        key: { $in: batch },
+        deletedAt: null,
+      });
+      for (const row of rows) {
+        out.push({
+          key: row.key,
+          value: Buffer.from(row.value),
+          version: row.version,
+          contentType: row.contentType ?? null,
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Medium state unknown (no dictionary file): void every persisted
+   * claim so the full local state is pushed and confirmed again.
+   * Idempotent and exact — dirty rows stay dirty.
+   */
+  async requeueSpace(spaceId: string): Promise<number> {
+    return this.em.nativeUpdate(SpaceKeySchema, { space: spaceId }, { lastPersistedVersion: 0 });
   }
 
   async markKeyPersisted(keyId: string, version: number): Promise<boolean> {
@@ -531,6 +659,7 @@ export class StorageEngineService {
       usedBytes: space.usedBytes,
       state: space.state,
       providerType: space.providerType,
+      providerConfig: (space.providerConfig ?? null) as Record<string, unknown> | null,
     };
   }
 

@@ -52,6 +52,19 @@ describe('storage formats', () => {
     expect(parseDictionary(serializeDictionary(emptyDictionary())).dictionaryVersion).toBe(0);
   });
 
+  it('round-trips parse-mutate-serialize without checksum drift', () => {
+    const dictionary = {
+      ...emptyDictionary(),
+      dictionaryVersion: 1,
+      entries: { 'a/1': { blockId: 'blk_1', keyVersion: 5 } },
+      blocks: { blk_1: { blockVersion: 1, keyCount: 1, liveBytes: 10 } },
+    };
+    const once = parseDictionary(serializeDictionary(dictionary));
+    delete once.entries['a/1'];
+    // Must not throw: the stale checksum is replaced, not covered.
+    expect(() => parseDictionary(serializeDictionary(once))).not.toThrow();
+  });
+
   it('rejects tampered checksums', () => {
     const good = JSON.parse(serializeBlock({
       format: BLOCK_FORMAT,

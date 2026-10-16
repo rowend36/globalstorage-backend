@@ -12,8 +12,16 @@ import {
   BadRequestException,
   NotFoundException,
   PayloadTooLargeException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { SpaceKeySchema, SpaceSchema, UserSchema } from '../database/entities';
+import { DictionaryCache } from '../storage/dictionary-cache';
+import {
+  BLOCK_FORMAT,
+  DICTIONARY_FORMAT,
+  serializeBlock,
+  serializeDictionary,
+} from '../storage/formats';
 
 const MB = 1024 * 1024;
 
@@ -42,9 +50,11 @@ describe('StorageEngineService', () => {
   const buildService = (locks?: never) => {
     handled = [];
     const config = configFor();
-    scheduler = new FlushScheduler(config, {
+    scheduler = new FlushScheduler(config);
+    scheduler.registerHandler({
       handle: async (spaceIds: string[]) => {
         handled.push(spaceIds);
+        return [];
       },
     });
     return new StorageEngineService(orm.em.fork(), config, scheduler, locks);
@@ -510,8 +520,126 @@ describe('StorageEngineService', () => {
     expect(validateKeyName('todos/123')).toBe('todos/123');
     expect(() => validateKeyName('')).toThrow('Key must not be empty');
     expect(() => validateKeyName('a'.repeat(513))).toThrow();
-    expect(() => validateKeyName('bad\u0007key')).toThrow('control characters');
+    expect(() => validateKeyName('badkey')).toThrow('control characters');
     expect(validateSpaceName('  Notes ')).toBe('Notes');
     expect(() => validateSpaceName('  ')).toThrow();
+  });
+
+  describe('medium hydrate', () => {
+    const seedMedium = async (
+      store: Map<string, Buffer>,
+      spaceId: string,
+      key: string,
+      blockId: string,
+      version: number,
+      value: string,
+    ) => {
+      store.set(
+        `${spaceId}/blocks/${blockId}`,
+        serializeBlock({
+          format: BLOCK_FORMAT,
+          blockId,
+          blockVersion: 1,
+          entries: {
+            [key]: {
+              value: Buffer.from(value).toString('base64'),
+              keyVersion: version,
+              contentType: 'text/plain',
+              updatedAt: new Date(version).toISOString(),
+            },
+          },
+        }),
+      );
+      store.set(
+        `${spaceId}/dictionary`,
+        serializeDictionary({
+          format: DICTIONARY_FORMAT,
+          dictionaryVersion: 1,
+          entries: { [key]: { blockId, keyVersion: version } },
+          blocks: { [blockId]: { blockVersion: 1, keyCount: 1, liveBytes: 10 } },
+        }),
+      );
+    };
+
+    const buildServiceWithMedium = (store: Map<string, Buffer>, reads: string[]) => {
+      const adapter = {
+        read: async (spaceId: string, resourceKey: string) => {
+          reads.push(`${spaceId}/${resourceKey}`);
+          return store.get(`${spaceId}/${resourceKey}`) ?? null;
+        },
+        write: async () => ({ etag: 'x' }),
+        delete: async () => {},
+        list: async () => [],
+        getCapabilities: () => ({ targetBlockBytes: 100 * 1024, conditionalWrites: true }),
+      } as never;
+      const config = configFor();
+      const localScheduler = new FlushScheduler(config);
+      return new StorageEngineService(
+        orm.em.fork(),
+        config,
+        localScheduler,
+        undefined,
+        adapter,
+        new DictionaryCache(),
+      );
+    };
+
+    it('hydrates missing rows from the medium as persisted', async () => {
+      const space = await service.createSpace(ownerId, 'Hydrate');
+      const version = Date.now() + 5000;
+      const store = new Map<string, Buffer>();
+      const reads: string[] = [];
+      await seedMedium(store, space.id, 'remote', 'blk_1', version, 'from-medium');
+      const withMedium = buildServiceWithMedium(store, reads);
+
+      const read = await withMedium.readKey({ ownerId, spaceId: space.id, key: 'remote' });
+      expect(read.value.toString()).toBe('from-medium');
+      expect(read.version).toBe(version);
+      expect(read.contentType).toBe('text/plain');
+      expect(await withMedium.listDirtyKeys(space.id)).toHaveLength(0);
+      // Second read is served locally without touching the medium.
+      const before = reads.length;
+      await withMedium.readKey({ ownerId, spaceId: space.id, key: 'remote' });
+      expect(reads.length).toBe(before);
+    });
+
+    it('returns 404 without medium contact for tombstones and unknown keys', async () => {
+      const space = await service.createSpace(ownerId, 'Hydrate404');
+      await service.writeKey({ ownerId, spaceId: space.id, key: 'gone', value: Buffer.from('x') });
+      await service.deleteKey({ ownerId, spaceId: space.id, key: 'gone' });
+      const store = new Map<string, Buffer>();
+      const reads: string[] = [];
+      const withMedium = buildServiceWithMedium(store, reads);
+      await expect(
+        withMedium.readKey({ ownerId, spaceId: space.id, key: 'gone' }),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      // Tombstones never touch the medium (read-your-deletes).
+      expect(reads).toEqual([]);
+      await expect(
+        withMedium.readKey({ ownerId, spaceId: space.id, key: 'nope' }),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      // A genuine miss consults the dictionary once, then 404s.
+      expect(reads).toEqual([`${space.id}/dictionary`]);
+    });
+
+    it('fails explicitly on inconsistent medium state', async () => {
+      const space = await service.createSpace(ownerId, 'HydrateBad');
+      const version = Date.now() + 5000;
+      const store = new Map<string, Buffer>();
+      store.set(
+        `${space.id}/dictionary`,
+        serializeDictionary({
+          format: DICTIONARY_FORMAT,
+          dictionaryVersion: 1,
+          entries: { k: { blockId: 'blk_missing', keyVersion: version } },
+          blocks: {},
+        }),
+      );
+      const reads: string[] = [];
+      const withMedium = buildServiceWithMedium(store, reads);
+      await expect(
+        withMedium.readKey({ ownerId, spaceId: space.id, key: 'k' }),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    });
   });
 });

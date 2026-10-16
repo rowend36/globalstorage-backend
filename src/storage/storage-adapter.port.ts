@@ -41,6 +41,8 @@ export interface StorageAdapter {
   ): Promise<StorageWriteResult>;
   /** Idempotent: deleting a missing resource succeeds. */
   delete(spaceId: string, resourceKey: string): Promise<void>;
+  /** Resource keys under a prefix (`''` = all), sorted. Needed for space purges and recovery scans. */
+  list(spaceId: string, prefix: string): Promise<string[]>;
   getCapabilities(): StorageCapabilities;
 }
 

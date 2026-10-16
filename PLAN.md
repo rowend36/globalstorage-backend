@@ -126,16 +126,22 @@ block versions, no copy-on-write publish, no retiring.
   write.
 - **Flush path** (debounced timer): acquire the dictionary lock and
   **hold it for the whole cycle** → read the dictionary once
-  (authoritative) → **reconcile** (§2.8: cooldown-gated bulk refresh
-  via `blockVersion`, then version-ordering rules incl. the deletion
-  rule) → plan the complete target layout (allocate,
-  rearrange/restructure — all before any medium write) → acquire every
-  block lock in the plan (deterministic order) and hold them too →
-  apply blocks + dictionary inside the same locked critical section →
-  mark keys persisted (conditional on version: an old flush must never
-  flip a newer write), purge confirmed tombstones → release ALL locks
-  (blocks, dict last). Busy blocks/arrangements are skipped and stay
-  dirty for the next flush.
+  (authoritative; absent → requeue all local rows first, voiding every
+  persisted claim, then push everything) → **reconcile** (§2.8:
+  cooldown-gated bulk refresh via `blockVersion`, then version-ordering
+  rules incl. the deletion rule) → plan the complete target layout
+  (allocate, rearrange/restructure — all before any medium write) →
+  acquire every block lock in the plan (deterministic order) and hold
+  them too → apply blocks + dictionary inside the same locked critical
+  section → mark keys persisted (conditional on version: an old flush
+  must never flip a newer write), purge confirmed tombstones → release
+  ALL locks (blocks, dict last). Busy blocks/arrangements are skipped
+  and stay dirty for the next flush. The handler reports backpressure
+  (returns unflushed space ids) instead of blocking; the scheduler
+  retries them on its cadence. The worker self-registers with the
+  scheduler in `onModuleInit` — constructor-injecting the handler would
+  close a Worker→Engine→Scheduler→Worker resolution cycle that hangs
+  Nest silently.
 - **Deletion**: deleting sets `deletedAt` (timestamp version), clears
   `value`/`contentType`, frees the quota immediately — the row becomes
   a pending-delete tombstone, so the flush knows the medium removal is

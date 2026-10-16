@@ -10,9 +10,11 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 describe('FlushScheduler', () => {
   it('debounces rapid schedules into one handler call', async () => {
     const calls: string[][] = [];
-    const scheduler = new FlushScheduler(configFor(10), {
+    const scheduler = new FlushScheduler(configFor(10));
+    scheduler.registerHandler({
       handle: async (spaceIds: string[]) => {
         calls.push(spaceIds);
+        return [];
       },
     });
     scheduler.schedule('a');
@@ -28,13 +30,15 @@ describe('FlushScheduler', () => {
   it('drains on demand and retains batches when the handler fails', async () => {
     let failures = 1;
     const calls: string[][] = [];
-    const scheduler = new FlushScheduler(configFor(10_000), {
+    const scheduler = new FlushScheduler(configFor(10_000));
+    scheduler.registerHandler({
       handle: async (spaceIds: string[]) => {
         if (failures > 0) {
           failures -= 1;
           throw new Error('worker down');
         }
         calls.push(spaceIds);
+        return [];
       },
     });
     scheduler.schedule('a');
@@ -53,6 +57,16 @@ describe('FlushScheduler', () => {
     expect(scheduler.pendingSpaces()).toEqual(['a']);
     scheduler.cancel('a');
     expect(scheduler.pendingSpaces()).toEqual([]);
+    scheduler.onModuleDestroy();
+  });
+
+  it('retains spaces the handler reports back and retries them', async () => {
+    const scheduler = new FlushScheduler(configFor(10_000));
+    scheduler.registerHandler({ handle: async () => ['a'] });
+    scheduler.schedule('a');
+    scheduler.schedule('b');
+    await scheduler.drain();
+    expect(scheduler.pendingSpaces()).toEqual(['a']);
     scheduler.onModuleDestroy();
   });
 });

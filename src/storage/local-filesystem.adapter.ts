@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { mkdir, open, readFile, rename, unlink, link } from 'node:fs/promises';
-import { dirname, join, sep } from 'node:path';
+import { mkdir, open, readFile, readdir, rename, unlink, link } from 'node:fs/promises';
+import { dirname, join, relative, sep } from 'node:path';
 import type { AppConfig } from '../config/configuration';
 import { sha256Hex } from './formats';
 import {
@@ -70,21 +70,48 @@ export class LocalFilesystemAdapter implements StorageAdapter {
     }
   }
 
+  async list(spaceId: string, prefix: string): Promise<string[]> {
+    this.checkSegment(spaceId);
+    const segments = prefix === '' ? [] : prefix.split('/');
+    for (const segment of segments) this.checkSegment(segment);
+    const base = join(this.root, spaceId, ...segments);
+    const out: string[] = [];
+    await this.walk(base, base, out);
+    return out.sort();
+  }
+
+  private async walk(dir: string, base: string, out: string[]): Promise<void> {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) await this.walk(full, base, out);
+      else if (entry.isFile()) out.push(relative(base, full).split(sep).join('/'));
+    }
+  }
+
   private resolve(spaceId: string, resourceKey: string): string {
     const segments = [spaceId, ...resourceKey.split('/')];
-    for (const segment of segments) {
-      if (
-        !segment ||
-        segment === '.' ||
-        segment === '..' ||
-        segment.includes(sep) ||
-        segment.includes('\\') ||
-        segment.includes('\0')
-      ) {
-        throw new Error(`Refusing to resolve unsafe storage path segment: ${segment}`);
-      }
-    }
+    for (const segment of segments) this.checkSegment(segment);
     return join(this.root, ...segments);
+  }
+
+  private checkSegment(segment: string): void {
+    if (
+      !segment ||
+      segment === '.' ||
+      segment === '..' ||
+      segment.includes(sep) ||
+      segment.includes('\\') ||
+      segment.includes('\0')
+    ) {
+      throw new Error(`Refusing to resolve unsafe storage path segment: ${segment}`);
+    }
   }
 
   private async writeAtomic(path: string, data: Buffer): Promise<void> {
