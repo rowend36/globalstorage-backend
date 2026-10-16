@@ -119,29 +119,26 @@ a format-version header**. Format versions are unrelated to block
 Blocks are **mutable and updated in place** under lock. No immutable
 block versions, no copy-on-write publish, no retiring.
 
-- **Write path** (hot, cheap): validate request → check auth/space/
+- **Write path** (hot, never waits): validate request → check auth/space/
   quota → commit key row in one operational transaction (version =
-  `max(nowMs, currentVersion + 1)`, now dirty) → best-effort pre-lock
-  (see §2.7) → acknowledge. Lock state never blocks an acknowledged
-  write.
-- **Flush path** (debounced timer): acquire the dictionary lock and
-  **hold it for the whole cycle** → read the dictionary once
-  (authoritative; absent → requeue all local rows first, voiding every
-  persisted claim, then push everything) → **reconcile** (§2.8:
-  cooldown-gated full keyVersion compare, then version-ordering rules
-  incl. the deletion rule) → plan the complete target layout
-  (allocate, rearrange/restructure — all before any medium write) →
-  acquire every block lock in the plan (deterministic order) and hold
-  them too → apply blocks + dictionary inside the same locked critical
-  section → mark keys persisted (conditional on version: an old flush
-  must never flip a newer write), purge confirmed tombstones → release
-  ALL locks (blocks, dict last). Busy blocks/arrangements are skipped
-  and stay dirty for the next flush. The handler reports backpressure
-  (returns unflushed space ids) instead of blocking; the scheduler
-  retries them on its cadence. The worker self-registers with the
-  scheduler in `onModuleInit` — constructor-injecting the handler would
-  close a Worker→Engine→Scheduler→Worker resolution cycle that hangs
-  Nest silently.
+  `max(nowMs, currentVersion + 1)`, now dirty) → best-effort pre-lock →
+  acknowledge. Lock state never blocks an acknowledged write. The
+  pre-lock is best-effort correctness, not a gate: acquiring follows the
+  configured strategy (§2.7) with dict-first ordering, and while the
+  block stays held, later reads serve the local row directly (no newer
+  medium state can exist); when acquisition fails, the write still
+  commits and reads fall back to version-checked behavior.
+- **Flush path** (debounced timer): fast path when every needed block is
+  already held and nothing needs moving — update blocks only, no
+  dictionary, no dict lock, both strategies identical. Otherwise the
+  structural path (§2.7): reconcile, plan, acquire the full lock set,
+  apply, publish under the held dict lock, mark persisted, purge
+  confirmed tombstones. The handler reports backpressure (returns
+  unflushed space ids) instead of blocking; the scheduler retries them
+  on its cadence. The worker self-registers with the scheduler in
+  `onModuleInit` — constructor-injecting the handler would close a
+  Worker→Engine→Scheduler→Worker resolution cycle that hangs Nest
+  silently.
 - **Deletion**: deleting sets `deletedAt` (timestamp version), clears
   `value`/`contentType`, frees the quota immediately — the row becomes
   a pending-delete tombstone, so the flush knows the medium removal is
@@ -151,13 +148,17 @@ block versions, no copy-on-write publish, no retiring.
   its last key is gone. That is the ONLY way blocks go stale — there is
   no retired-block set and no deferred GC in Stage 1. Crash-orphaned
   unreferenced files are a later-stage reconcile concern.
-- **Reads**: always the operational row first (tombstoned → 404, no
-  medium consult). On a miss, consult the dictionary (cache or medium):
-  key present → fetch the envelope from its block, create/update the DB
-  row, return it (hydrate-on-read); key absent → genuine 404. A newer
-  local value is never replaced by an older external value; a read that
-  cannot be served safely fails explicitly with the space marked
-  `unhealthy`.
+- **Reads**: operational row first. Tombstoned → 404 without medium
+  contact. Live row in a continuously-held block → serve directly (no
+  newer medium state can exist; hold-continuity tracked, lapse forces
+  re-sync first). Otherwise consult the dictionary (cache, else load):
+  entry absent → genuine 404; entry newer than the row → lock the block
+  (bounded by `readTimeoutMs`), re-read, pull, serve; lock/read failure
+  → serve the cached row if present, else 503, while the attempt
+  continues in the background (singleflight per block, capped retries)
+  to warm the cache for the next read. A newer local value is never
+  replaced by an older external value; a read that cannot be served
+  safely fails explicitly with the space marked `unhealthy`.
 
 ### 2.8 Sync from the medium (medium → DB direction)
 
@@ -190,22 +191,30 @@ clocks if it ever bites).
   space `unhealthy`. Near-impossible with timestamp versions; kept as
   the backstop. Never guess.
 
-**The two sync triggers** (bulk refresh is cooldown-gated on both —
-targeted per-key checks always apply):
+**Sync triggers and refresh** (bulk work is cooldown-gated —
+`syncCooldownMs`, default 5000; targeted per-key checks always apply):
 
-1. **Lock time** (flush start, under the held dict lock): if the
-   per-space cooldown (`syncCooldownMs`, default 5000) has elapsed
-   since the last sync, compare every dictionary entry's `keyVersion`
-   against local rows, then apply the ordering rules above, before
-   planning. No block-level baseline is kept: the dictionary must be
-   fully walked for planning anyway, and per-key versions already gate
-   every expensive block read — a block-version skip would save only an
-   in-memory compare loop at the cost of baseline bookkeeping and its
-   false-baseline trap. This is what keeps instances sharing one
-   medium coherent.
-2. **Read miss** (`404` in DB, key present in dictionary): hydrate the
-   row from the block envelope and serve it, always (single key, cheap).
-   Genuine 404 only when the key is in neither.
+1. **Lock time** (flush start, under the held dict lock): compare every
+   dictionary entry's `keyVersion` against local rows, then apply the
+   ordering rules above, before planning. No block-level baseline is
+   kept: the dictionary must be fully walked for planning anyway, and
+   per-key versions already gate every expensive block read — a
+   block-version skip would save only an in-memory compare loop at the
+   cost of baseline bookkeeping and its false-baseline trap. This is
+   what keeps instances sharing one medium coherent. Reconcile
+   discoveries are returned as change events
+   (`spaceId, key, oldVersion, newVersion, operation`) — currently
+   logged, consumed by the watch stage later.
+2. **Read miss or indicated staleness**: pull the single key as §2.5
+   describes (lock-bounded, version-checked, fallback on timeout, never
+   clobbering newer local state).
+3. **Refresh (SWR semantics, watch foundation)**: re-reading held blocks
+   needs no lock ops and no dictionary IO (mappings pinned by held
+   locks), so currency checks are cheap: serve local immediately,
+   revalidate in the background within the cooldown, pull on newer. The
+   standalone interval/subscription-driven refresh trigger and fan-out
+   are watch-stage work; the primitive, the event shape, and the cheap
+   property are Stage 1.
 
 **Delete races across instances** (future): a delete flushed as a bare
 entry-removal can be undone by a concurrent unflushed write with an
@@ -282,35 +291,83 @@ it while planning needs the full key→block map.
 
 ### 2.7 Locking protocol
 
-- **Hold everything till flush**: the flush acquires the dictionary
-  lock first, reads the dictionary once, plans against it, acquires
-  every block lock in the plan in deterministic block-id order, and
-  holds ALL of them — dict included — until the flush completes.
-  One authoritative dictionary read, no re-reads, no mapping drift.
-  (Releasing the dict early would force a fresh dictionary read before
-  every subsequent block access, for the same stability reasons the
-  dict lock exists at all.)
-- **Rearrangements lock everything they touch**: any operation that
-  moves entries between blocks (source AND destination blocks, splits,
-  merges) must first hold locks on **all** participating blocks —
-  acquired in deterministic block-id order while holding the dict lock,
-  all-or-nothing. Overstored flushes serialize instead of deadlocking.
-- **Contention**: a busy block/arrangement is skipped; keys stay dirty
-  and retry on the next write or flush (bounded backoff in later stages).
-- **Future merges** follow the same rule: a merge plan locks every
-  source and destination block (deterministic order) before moving a
-  single entry; only non-active fragmented blocks are merge candidates.
-- On first write to a key, use the in-memory **dictionary cache**
-  (loaded from the medium on miss, best-effort) for the best-effort
-  pre-lock — there is no separate advisory map: dict lock → resolve →
-  block lock → release dict, block held till flush. At flush start,
-  under the held dict lock, re-verify each pre-locked key's mapping
-  once: changed → release the stale pre-lock and resolve fresh;
-  unchanged → fold it into the plan's lock set. The flush never depends
-  on whether the pre-lock succeeded.
-- **Leases cover the whole hold window**: debounce + flush apply. The
-  flush renews leases mid-apply for large batches; every write and the
-  dictionary update are fenced, so an expired worker can never publish.
+Locks are medium resources (`locks/<resource>`), discoverable by every
+conformant instance sharing the storage. Each carries owner (per-process
+random — a restarted process is never the same holder, which is what
+makes fencing sound), fencing token, and lease expiry. They coordinate
+conformant instances only; non-conformant writers bypass them (handled
+by §2.6).
+
+**Families and lifetimes.** Dictionary locks are short and
+transactional: acquired to stabilize a mapping operation, lapsed
+shortly after — never explicitly released except via the purge prefix
+wipe. Block locks are long and sticky: acquired (pre-lock at write, or
+first flush), renewed while hot, lapsed when cold. The asymmetry is
+principled: dict exclusion is space-global (prompt lapse matters),
+block exclusion is selective (retention is reservation). No
+steady-state explicit releases anywhere: expiry is the lifecycle, and
+crash-safety falls out free — nothing depends on a release call a dead
+process never makes. Explicit deletion happens only for proven-useless
+locks (stale pre-locks at flush) and the purge wipe.
+
+**Dict-first ordering, always.** Every block-lock acquisition sequence
+begins holding the dict lock — otherwise you may lock the wrong block,
+and on Drive/GitHub-class media each wasted acquisition costs hundreds
+of milliseconds plus quota. The dict lock alone doesn't guarantee
+correctness (only dict-lock + fresh mapping does); it guarantees you're
+not acquiring blind. Resolution source is tiered for economy:
+cache-first (staleness bounded by flush recency), fresh dict read on
+cache miss; the flush always fresh-reads for planning. Pre-lock dict
+acquisitions are singleflighted per space so bursts share one round.
+
+**Acquisition strategies** (acquisition paths only — flush publishing
+always happens under a held dict lock regardless). Configurable per
+adapter capability with space override (`lockStrategy`; local default
+pessimistic, quota-limited media default optimistic):
+- *Pessimistic*: hold dict → resolve → acquire blocks (deterministic id
+  order, all-or-nothing) → proceed. Pays dict ops on every attempt;
+  never wastes a block acquisition; imposes a lease-long exclusion
+  window on other planners per attempt.
+- *Optimistic*: read dict → acquire block → re-read dict → validate
+  (fast path: `dictionaryVersion` equal → stable; verdict: entry-level
+  `blockId`+`keyVersion` compare for the key; timestamps make ABA
+  impossible, so failures are always safe retries) → proceed, or release
+  as useless + bounded retry (pre-lock: 1 retry then abandon to flush;
+  reads: bounded by `readTimeoutMs`; refresh: paced by interval). Zero
+  exclusion footprint when uncontended.
+- *Escalation*: an optimistic path that discovers structural need
+  (move/create) acquires the dict lock and proceeds pessimistically from
+  there. High contention → pessimistic wins (retries dominate); low
+  contention → optimistic wins (no footprint).
+- The flush fast path (all needed blocks already held, no structural
+  need) takes neither path: merely update blocks. The flush structural
+  path follows the configured strategy for discovery, then holds the
+  dict lock for publish in both cases.
+
+**Renewal needs no dict lock.** Renewal extends an existing hold
+(owner+fence match) without resolving anything — the fence check is the
+entire safety argument. Margin is proportional with floor: renew when
+remaining < `max(leaseMs × 0.25, 5000ms)` — longer leases imply costlier
+media, so renew earlier. Local-validity fast path: while comfortably
+within lease (local clock math, zero IO), skip all medium contact;
+touch the medium only at acquisition, margin-renewal, and fresh reads.
+(Cross-instance clock skew is a documented limitation.)
+
+**Single lock outside a flush.** Outside the flush critical section,
+never hold more than one block lock (release-then-acquire when
+switching; single-lock holders cannot deadlock). The flush is the only
+place holding lock sets, acquired deterministically. Same-process
+held locks stay compatible via adoption (same owner → renew-verify,
+not abandon). Reader pre-locks that prove stale are released as
+known-useless.
+
+**Contention and backpressure.** Busy locks are never waited on
+indefinitely: pre-lock failure changes nothing (write already
+committed); read waits are bounded by `readTimeoutMs` with background
+continuation (singleflight per block, capped retries); flush abandons
+the plan and reports the space back (unflushed ids) for scheduler retry.
+Retries use bounded backoff with jitter in later stages; Stage 1
+retries on the debounce cadence.
 - Stage 1 keeps rearrangements minimal: a key moves only when its block
   would exceed the target (or an oversized value needs its own block).
   No gratuitous compaction.
@@ -318,6 +375,30 @@ it while planning needs the full key→block map.
   the prefix wipe happens under it, so it can never race a flush.
 - **One space at a time**: a flush processes spaces sequentially, never
   holding two dict locks at once.
+
+### 2.9 Configuration reference
+
+Timing policy lives in global config (`persistence.*`); lease durations
+are per-medium (adapter capability defaults, space `providerConfig`
+override); packing/quotas as before. Fixed-in-code policy (not knobs):
+renewal margin `max(lease × 0.25, 5s)`, single-lock-outside-flush,
+fence/owner semantics, deterministic acquisition order, retry bounds
+(pre-lock 1 retry then abandon; reads bounded by timeout; refresh
+paced by interval).
+
+| Knob | Default | Level | Bounds |
+|---|---|---|---|
+| `flushDebounceMs` | 1000 | global | write→flush delay |
+| `syncCooldownMs` | 5000 | global | min interval between bulk reconciles |
+| `readTimeoutMs` | 1000 | global | read-path medium budget → fallback + background |
+| `readRetrySpacingMs` | 100 | global | lock-attempt spacing while attached |
+| `backgroundMaxAttempts` / `backgroundMaxElapsedMs` | 10 / 30s | global | detached continuation caps |
+| `dictLockLeaseMs` | 30s | capability → space override | one plan+publish window |
+| `blockLockLeaseMs` | 120s | capability → space override | debounce+flush+refresh retention |
+| `preLockLeaseMs` | 60s | fixed (covers write→adoption; adoption converts) | reservation window |
+| `lockStrategy` | pessimistic (local), optimistic (remote) | capability → space override | acquisition discipline |
+| `targetBlockBytes` | 100KB | capability → space override | packing |
+| `maxKeyBytes`, quotas | 10MB / 50MB / 1GB | `spaces.*` | admission |
 
 ## 3. Phases
 
@@ -364,10 +445,23 @@ Gates green. Dev server runs on :3000.
   (`{value, keyVersion, contentType, updatedAt}`), packing at the
   adapter's target size, in-place read-modify-write, move handling,
   delete-block-when-empty.
-- `FlushWorker`: §2.5/§2.6/§2.7 end-to-end (lock → cooldown-gated
-  reconcile per §2.8 → pack → write → verify → publish dictionary →
-  conditional persist-mark → purge confirmed tombstones → release;
-  unhealthy on higher-version or conflicting data).
+- `FlushWorker`: §2.5/§2.6/§2.7 end-to-end (fast path when all blocks
+  held, else lock → cooldown-gated reconcile per §2.8 → plan → write →
+  verify → publish dictionary under held dict lock → conditional
+  persist-mark → purge confirmed tombstones; backpressure via unflushed
+  ids; unhealthy on higher-version or conflicting data).
+
+### Phase 3c — Doctrine reconciliation (next)
+Bring the implementation to §2.7: `lockStrategy` capability + space
+override with optimistic validate paths and pessimistic escalation;
+pre-lock dict-first + singleflight + local short-circuit; lapse-based
+release (drop worker finally-release-all; purge wipe stays); renewal
+margin formula + local-validity fast paths; read path
+(staleness-indicated lock+read, timeout, fallback, background
+continuation, singleflight); serve-direct on held-continuous;
+flush fast path (skip dict when all held + no structural need);
+reconcile ChangeEvents. Done already: `getKeyEntries`, requeue,
+per-process owner ids, dict-free renewal.
 
 ### Phase 4 — API (spec §5.1 exactly)
 `GET/POST /v1/spaces`, `GET/PATCH/DELETE /v1/spaces/{id}`,
@@ -387,12 +481,11 @@ the running server, READMEs.
 
 ## 4. Explicitly out of scope (later stages per the spec roadmap)
 
-Durable mutation outbox, background worker processes, locking beyond
-Stage 1 needs, Solid/S3/Drive adapters, eviction sweeper, crash-recovery
-reconcile, merge/GC (incl. tombstone aging), medium dictionary
+Durable mutation outbox, background worker processes, Solid/S3/Drive
+adapters, eviction sweeper, orphan-block GC, medium dictionary
 tombstones for multi-instance delete races, hybrid logical clocks,
-OAuth applications, change notifications, real multi-user tenancy,
-paid plans.
+standalone refresh loop + watch fan-out, OAuth applications, change
+notifications, real multi-user tenancy, paid plans.
 
 ## 5. Standing rules (from this project's AGENTS.md)
 
