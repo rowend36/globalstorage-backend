@@ -15,13 +15,13 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { SpaceKeySchema, SpaceSchema, UserSchema } from '../database/entities';
-import { DictionaryCache } from '../storage/dictionary-cache';
+import { DictionaryCache } from '../storage_adapters/dictionary-cache';
 import {
   BLOCK_FORMAT,
   DICTIONARY_FORMAT,
   serializeBlock,
   serializeDictionary,
-} from '../storage/formats';
+} from '../storage_adapters/formats';
 
 const MB = 1024 * 1024;
 

@@ -16,15 +16,15 @@ import {
   STORAGE_ADAPTER,
   type LockStrategy,
   type StorageAdapter,
-} from '../storage/storage-adapter.port';
-import { DictionaryCache } from '../storage/dictionary-cache';
+} from '../storage_adapters/storage-adapter.port';
+import { DictionaryCache } from '../storage_adapters/dictionary-cache';
 import {
   StorageVersionError,
   parseBlock,
   parseDictionary,
   type BlockFile,
-} from '../storage/formats';
-import { needsRenew } from '../storage/medium-locks';
+} from '../storage_adapters/formats';
+import { needsRenew } from '../storage_adapters/medium-locks';
 import {
   SpaceKeySchema,
   SpaceSchema,

@@ -1,8 +1,13 @@
 /**
- * Storage-adapter port. Adapters persist opaque resources (blocks, the
- * dictionary, locks) to user-controlled storage behind this interface.
- * The engine never assumes a provider's native model: spaces map to a
- * prefix, resources to namespaced keys within it.
+ * Storage-adapter port for the Global Storage persistence layer. Adapters
+ * persist opaque resources (blocks, the dictionary, locks) to
+ * user-controlled storage behind this interface. The engine never assumes
+ * a provider's native model: spaces map to a prefix, resources to
+ * namespaced keys within it.
+ *
+ * NOTE — different layer from `src/storage/` (the template's generic
+ * object-store providers for files/attachments). A future S3 *block*
+ * adapter would implement THIS port, not reuse `StoragePort`.
  *
  * Resource keys (Stage 1 layout):
  * - `blocks/<blockId>` — packed key-value block

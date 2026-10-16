@@ -2,12 +2,12 @@ import { Module } from '@nestjs/common';
 import { StorageEngineService } from './engine.service';
 import { FlushScheduler } from './flush-scheduler';
 import { BLOCK_LOCKS, FLUSH_HANDLER } from './ports';
-import { BlockManager } from '../storage/block-manager';
-import { DictionaryCache } from '../storage/dictionary-cache';
-import { FlushWorker } from '../storage/flush-worker';
-import { LocalFilesystemAdapter } from '../storage/local-filesystem.adapter';
-import { MediumLockService } from '../storage/medium-locks';
-import { STORAGE_ADAPTER } from '../storage/storage-adapter.port';
+import { BlockManager } from '../storage_adapters/block-manager';
+import { DictionaryCache } from '../storage_adapters/dictionary-cache';
+import { FlushWorker } from '../storage_adapters/flush-worker';
+import { LocalFilesystemAdapter } from '../storage_adapters/local-filesystem.adapter';
+import { MediumLockService } from '../storage_adapters/medium-locks';
+import { STORAGE_ADAPTER } from '../storage_adapters/storage-adapter.port';
 
 /**
  * Operational engine plus its storage layer. Everything lives in one
@@ -16,7 +16,7 @@ import { STORAGE_ADAPTER } from '../storage/storage-adapter.port';
  * the handler into the scheduler would close a resolution cycle that
  * hangs Nest silently, so the worker self-registers in onModuleInit
  * instead. Code is organized by layer (`engine/` = operational KV,
- * `storage/` = medium), wired here as one bounded context.
+ * `storage_adapters/` = medium), wired here as one bounded context.
  */
 @Module({
   providers: [
