@@ -388,8 +388,8 @@ export class StorageEngineService {
   // owner check): only our own worker calls these, never the API layer.
 
   async listDirtyKeys(spaceId: string, limit = DIRTY_LIST_LIMIT): Promise<DirtyKey[]> {
-    const rows = (await this.sql(this.em, SpaceKeySchema)
-      .select([raw('id, key, version, value, content_type, deleted_at')])
+    const rows = (await this.sql(this.em, SpaceKeySchema, 'k')
+      .select(['k.id', 'k.key', 'k.version', 'k.value', 'k.contentType', 'k.deletedAt'])
       .where({ space: spaceId })
       .andWhere('version > last_persisted_version')
       .orderBy({ key: 'ASC' })
@@ -413,8 +413,8 @@ export class StorageEngineService {
   }
 
   async listKeyVersions(spaceId: string): Promise<KeyVersionInfo[]> {
-    const rows = (await this.sql(this.em, SpaceKeySchema)
-      .select([raw('key, version, deleted_at')])
+    const rows = (await this.sql(this.em, SpaceKeySchema, 'k')
+      .select(['k.key', 'k.version', 'k.deletedAt'])
       .where({ space: spaceId })
       .execute('all')) as Array<{ key: string; version: number | string; deleted_at: unknown }>;
     return rows.map((row) => ({
@@ -519,8 +519,8 @@ export class StorageEngineService {
    * expressed as string/embedded-raw fragments: object-where syntax
    * cannot represent `SUM()` or `version > last_persisted_version`.
    */
-  private sql<T extends object>(em: EntityManager, entity: EntityName<T>) {
-    return (em as SqlEntityManager).createQueryBuilder(entity);
+  private sql<T extends object>(em: EntityManager, entity: EntityName<T>, alias?: string) {
+    return (em as SqlEntityManager).createQueryBuilder(entity, alias);
   }
 
   private toSpaceSummary(space: Space): SpaceSummary {
