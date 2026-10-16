@@ -128,8 +128,8 @@ block versions, no copy-on-write publish, no retiring.
   **hold it for the whole cycle** → read the dictionary once
   (authoritative; absent → requeue all local rows first, voiding every
   persisted claim, then push everything) → **reconcile** (§2.8:
-  cooldown-gated bulk refresh via `blockVersion`, then version-ordering
-  rules incl. the deletion rule) → plan the complete target layout
+  cooldown-gated full keyVersion compare, then version-ordering rules
+  incl. the deletion rule) → plan the complete target layout
   (allocate, rearrange/restructure — all before any medium write) →
   acquire every block lock in the plan (deterministic order) and hold
   them too → apply blocks + dictionary inside the same locked critical
@@ -195,10 +195,14 @@ targeted per-key checks always apply):
 
 1. **Lock time** (flush start, under the held dict lock): if the
    per-space cooldown (`syncCooldownMs`, default 5000) has elapsed
-   since the last sync, refresh stale rows — only blocks whose
-   `blockVersion` changed are descended into — then apply the ordering
-   rules above, before planning. This is what keeps instances sharing
-   one medium coherent.
+   since the last sync, compare every dictionary entry's `keyVersion`
+   against local rows, then apply the ordering rules above, before
+   planning. No block-level baseline is kept: the dictionary must be
+   fully walked for planning anyway, and per-key versions already gate
+   every expensive block read — a block-version skip would save only an
+   in-memory compare loop at the cost of baseline bookkeeping and its
+   false-baseline trap. This is what keeps instances sharing one
+   medium coherent.
 2. **Read miss** (`404` in DB, key present in dictionary): hydrate the
    row from the block envelope and serve it, always (single key, cheap).
    Genuine 404 only when the key is in neither.
@@ -236,12 +240,35 @@ its lock set:
   hold few live entries — into fewer blocks. Active (hot) blocks are
   never merge targets.
 - The dictionary stores **per-block stats** alongside the key mapping
-  (`blockVersion` bumped on every block write, live key count, live
-  bytes, target size). `blockVersion` drives the reconcile fast path
-  (only changed blocks are descended into); the rest lets a future
-  merge pass find fragmented non-active blocks without scanning block
-  contents. Stage 1 writes all stats, uses `blockVersion`, and defers
-  merge decisions.
+  (live key count, live bytes) so a future merge pass can find
+  fragmented non-active blocks without scanning block contents.
+  Deliberately no block versions: per-key `keyVersion`s already gate
+  every expensive read, and the dictionary walk is unavoidable for
+  planning — a version skip would save only compares at the cost of
+  baseline state. Stage 1 writes the stats and defers merge decisions.
+
+### Dictionary size estimate
+
+Measured against the actual serialized format (verified empirically):
+
+```
+dict_bytes ≈ 150 + N × (K_avg + 64) + B × 56
+```
+
+- `150`: fixed overhead (`format`, `dictionaryVersion`, 64-char
+  `checksum`, braces).
+- Per key: the UTF-8 key bytes plus a **constant 64 bytes** of envelope
+  (`"blockId": "blk_<16 hex>"`, 13-digit `"keyVersion"`, braces,
+  separators) — constant regardless of key length.
+- Per block: ~56 bytes of stats (`keyCount`, `liveBytes`).
+- `keyVersion` timestamps stay 13 digits until the year 2286, so the
+  per-entry cost is stable; block ids are a fixed 20 chars.
+
+Worked examples (K_avg = 20): 1K keys ≈ 85 KB; 100K keys ≈ 8.4 MB;
+1M keys ≈ 84 MB in a single JSON file. That file size — not the compare
+loop — is the scaling wall: sharding the dictionary (fetch only needed
+entries) is the later-stage answer, and no version trick avoids reading
+it while planning needs the full key→block map.
 
 ### 2.6 Conflict policy (handles non-conformant writers and crashes)
 
@@ -336,7 +363,7 @@ Gates green. Dev server runs on :3000.
 - `BlockManager`: versioned envelope entries
   (`{value, keyVersion, contentType, updatedAt}`), packing at the
   adapter's target size, in-place read-modify-write, move handling,
-  delete-block-when-empty, `blockVersion` bump on every block write.
+  delete-block-when-empty.
 - `FlushWorker`: §2.5/§2.6/§2.7 end-to-end (lock → cooldown-gated
   reconcile per §2.8 → pack → write → verify → publish dictionary →
   conditional persist-mark → purge confirmed tombstones → release;
