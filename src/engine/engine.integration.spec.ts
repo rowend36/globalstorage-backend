@@ -34,7 +34,14 @@ const configFor = (overrides: Record<string, unknown> = {}) =>
           aggregateQuotaBytes: 1024 * MB,
           maxKeyBytes: 10 * MB,
         },
-        persistence: { flushDebounceMs: 10, syncCooldownMs: 5000 },
+        persistence: {
+          flushDebounceMs: 10,
+          syncCooldownMs: 5000,
+          readTimeoutMs: 5000,
+          readRetrySpacingMs: 10,
+          backgroundMaxAttempts: 5,
+          backgroundMaxElapsedMs: 2000,
+        },
       };
       return { ...(base[key] as object), ...(overrides[key] as object) } as never;
     },
@@ -476,10 +483,15 @@ describe('StorageEngineService', () => {
     const space = await service.createSpace(ownerId, 'Prelock');
     const located: Array<{ spaceId: string; key: string }> = [];
     const acquired: Array<{ spaceId: string; blockId: string }> = [];
+    const dictAcquired: string[] = [];
     const locks = {
       locateKeyBlock: async (spaceId: string, key: string) => {
         located.push({ spaceId, key });
         return 'blk_1';
+      },
+      acquireDictionary: async (spaceId: string) => {
+        dictAcquired.push(spaceId);
+        return 'dict-fence';
       },
       tryAcquire: async (spaceId: string, blockId: string) => {
         acquired.push({ spaceId, blockId });
@@ -489,6 +501,8 @@ describe('StorageEngineService', () => {
     } as never;
     const withLocks = buildService(locks);
     await withLocks.writeKey({ ownerId, spaceId: space.id, key: 'k', value: Buffer.from('v') });
+    // Dict-first ordering: dictionary lock precedes block resolution.
+    expect(dictAcquired).toEqual([space.id]);
     expect(located).toEqual([{ spaceId: space.id, key: 'k' }]);
     expect(acquired).toEqual([{ spaceId: space.id, blockId: 'blk_1' }]);
     expect(withLocks.consumePreLocks(space.id)).toEqual([
@@ -498,12 +512,16 @@ describe('StorageEngineService', () => {
 
     // Lock contention or failure never fails the write.
     const failing = buildService({
+      acquireDictionary: async () => 'dict-fence',
       locateKeyBlock: async () => 'blk_1',
       tryAcquire: async () => null,
       release: async () => {},
     } as never);
     await failing.writeKey({ ownerId, spaceId: space.id, key: 'k2', value: Buffer.from('v') });
     const throwing = buildService({
+      acquireDictionary: async () => {
+        throw new Error('medium down');
+      },
       locateKeyBlock: async () => {
         throw new Error('medium down');
       },
@@ -514,6 +532,110 @@ describe('StorageEngineService', () => {
     // Without a lock provider, writes proceed with no pre-lock attempt.
     await service.writeKey({ ownerId, spaceId: space.id, key: 'k4', value: Buffer.from('v') });
     expect(service.consumePreLocks(space.id)).toEqual([]);
+  });
+
+  it('skips pre-lock acquisition for already-held blocks', async () => {
+    const space = await service.createSpace(ownerId, 'PrelockSkip');
+    let acquires = 0;
+    let dictAcquires = 0;
+    const locks = {
+      locateKeyBlock: async () => 'blk_1',
+      acquireDictionary: async () => {
+        dictAcquires += 1;
+        return 'dict-fence';
+      },
+      tryAcquire: async () => {
+        acquires += 1;
+        return 'fence-1';
+      },
+      release: async () => {},
+    } as never;
+    const withLocks = buildService(locks);
+    await withLocks.writeKey({ ownerId, spaceId: space.id, key: 'k', value: Buffer.from('v') });
+    await withLocks.writeKey({ ownerId, spaceId: space.id, key: 'k', value: Buffer.from('v2') });
+    expect(acquires).toBe(1);
+    // Second write skips both acquisitions: block held-valid (short
+    // circuit) and dict hold still valid (no re-acquire).
+    expect(dictAcquires).toBe(1);
+  });
+
+  it('resolves the lock strategy per space with pessimistic default', async () => {
+    const space = await service.createSpace(ownerId, 'Strategy');
+    expect(await service.strategyFor(space.id)).toBe('pessimistic');
+    expect(await service.strategyFor('missing')).toBe('pessimistic');
+    await orm.em.fork().nativeUpdate(
+      SpaceSchema,
+      { id: space.id },
+      { providerConfig: { lockStrategy: 'optimistic' } },
+    );
+    // Cached default persists until invalidated...
+    expect(await service.strategyFor(space.id)).toBe('pessimistic');
+    await service.updateSpace(ownerId, space.id, { name: 'Strategy2' });
+    expect(await service.strategyFor(space.id)).toBe('optimistic');
+  });
+
+  it('pre-locks optimistically with re-read validation', async () => {
+    const space = await service.createSpace(ownerId, 'OptPrelock');
+    await orm.em.fork().nativeUpdate(
+      SpaceSchema,
+      { id: space.id },
+      { providerConfig: { lockStrategy: 'optimistic' } },
+    );
+    const acquired: string[] = [];
+    const released: string[] = [];
+    const locks = {
+      locateKeyBlock: async () => 'blk_1',
+      acquireDictionary: async () => {
+        throw new Error('optimistic path must not touch the dict lock');
+      },
+      tryAcquire: async (spaceId: string, blockId: string) => {
+        acquired.push(blockId);
+        return `fence-${blockId}`;
+      },
+      release: async (spaceId: string, blockId: string) => {
+        released.push(blockId);
+      },
+    } as never;
+    // Stub adapter serves R2 mapping reads for validation.
+    const store = new Map<string, Buffer>();
+    const seedDict = (block: string) => {
+      store.set(
+        `${space.id}/dictionary`,
+        serializeDictionary({
+          format: DICTIONARY_FORMAT,
+          dictionaryVersion: 1,
+          entries: { k: { blockId: block, keyVersion: 1 } },
+          blocks: {},
+        }),
+      );
+    };
+    seedDict('blk_1');
+    const config = configFor();
+    const localScheduler = new FlushScheduler(config);
+    const adapter = {
+      read: async (spaceId: string, key: string) => store.get(`${spaceId}/${key}`) ?? null,
+      write: async () => ({ etag: 'x' }),
+      delete: async () => {},
+      list: async () => [],
+      getCapabilities: () => ({
+        targetBlockBytes: 100 * 1024,
+        conditionalWrites: true,
+        lockStrategy: 'pessimistic',
+        dictLockLeaseMs: 30_000,
+        blockLockLeaseMs: 120_000,
+      }),
+    } as never;
+    const svc = new StorageEngineService(orm.em.fork(), config, localScheduler, locks, adapter, new DictionaryCache());
+    await svc.writeKey({ ownerId, spaceId: space.id, key: 'k', value: Buffer.from('v') });
+    expect(acquired).toEqual(['blk_1']);
+    expect(released).toEqual([]);
+
+    // Drift between R1 and R2: release wrong hold, acquire corrected once.
+    seedDict('blk_2');
+    svc.consumePreLocks(space.id);
+    await svc.writeKey({ ownerId, spaceId: space.id, key: 'k', value: Buffer.from('v2') });
+    expect(acquired).toEqual(['blk_1', 'blk_1', 'blk_2']);
+    expect(released).toEqual(['blk_1']);
   });
 
   it('validates key and space names', () => {
@@ -569,7 +691,13 @@ describe('StorageEngineService', () => {
         write: async () => ({ etag: 'x' }),
         delete: async () => {},
         list: async () => [],
-        getCapabilities: () => ({ targetBlockBytes: 100 * 1024, conditionalWrites: true }),
+        getCapabilities: () => ({
+          targetBlockBytes: 100 * 1024,
+          conditionalWrites: true,
+          lockStrategy: 'pessimistic',
+          dictLockLeaseMs: 30_000,
+          blockLockLeaseMs: 120_000,
+        }),
       } as never;
       const config = configFor();
       const localScheduler = new FlushScheduler(config);
@@ -639,6 +767,260 @@ describe('StorageEngineService', () => {
       await expect(
         withMedium.readKey({ ownerId, spaceId: space.id, key: 'k' }),
       ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    });
+
+    it('serves directly from held blocks without medium contact', async () => {
+      const space = await service.createSpace(ownerId, 'ServeDirect');
+      const store = new Map<string, Buffer>();
+      store.set(
+        `${space.id}/dictionary`,
+        serializeDictionary({
+          format: DICTIONARY_FORMAT,
+          dictionaryVersion: 1,
+          entries: { k: { blockId: 'blk_1', keyVersion: 1 } },
+          blocks: { blk_1: { keyCount: 1, liveBytes: 10 } },
+        }),
+      );
+      const reads: string[] = [];
+      const locks = {
+        locateKeyBlock: async () => 'blk_1',
+        acquireDictionary: async () => 'dict-fence',
+        tryAcquire: async () => 'fence-1',
+        release: async () => {},
+      } as never;
+      const config = configFor();
+      const localScheduler = new FlushScheduler(config);
+      const svc = new StorageEngineService(
+        orm.em.fork(),
+        config,
+        localScheduler,
+        locks,
+        {
+          read: async (spaceId: string, resourceKey: string) => {
+            reads.push(`${spaceId}/${resourceKey}`);
+            return store.get(`${spaceId}/${resourceKey}`) ?? null;
+          },
+          write: async () => ({ etag: 'x' }),
+          delete: async () => {},
+          list: async () => [],
+          getCapabilities: () => ({
+            targetBlockBytes: 100 * 1024,
+            conditionalWrites: true,
+            lockStrategy: 'pessimistic',
+            dictLockLeaseMs: 30_000,
+            blockLockLeaseMs: 120_000,
+          }),
+        } as never,
+        new DictionaryCache(),
+      );
+      await svc.writeKey({ ownerId, spaceId: space.id, key: 'k', value: Buffer.from('v') });
+      // Pre-lock set the re-sync flag: first read consults (loads dict, empty → serves row).
+      const first = await svc.readKey({ ownerId, spaceId: space.id, key: 'k' });
+      expect(first.value.toString()).toBe('v');
+      const afterConsult = reads.length;
+      expect(afterConsult).toBeGreaterThan(0);
+      // After reconcile clears the flag, the held block serves with zero IO.
+      svc.clearNeedsResync(space.id);
+      await svc.readKey({ ownerId, spaceId: space.id, key: 'k' });
+      expect(reads.length).toBe(afterConsult);
+    });
+
+    it('falls back fast on slow medium and warms in background', async () => {
+      const space = await service.createSpace(ownerId, 'SlowRead');
+      const written = await service.writeKey({
+        ownerId,
+        spaceId: space.id,
+        key: 'k',
+        value: Buffer.from('v1'),
+      });
+      const newer = written.version + 1000;
+      const store = new Map<string, Buffer>();
+      store.set(
+        `${space.id}/dictionary`,
+        serializeDictionary({
+          format: DICTIONARY_FORMAT,
+          dictionaryVersion: 1,
+          entries: { k: { blockId: 'blk_1', keyVersion: newer } },
+          blocks: { blk_1: { keyCount: 1, liveBytes: 10 } },
+        }),
+      );
+      store.set(
+        `${space.id}/blocks/blk_1`,
+        serializeBlock({
+          format: BLOCK_FORMAT,
+          blockId: 'blk_1',
+          entries: {
+            k: {
+              value: Buffer.from('v2').toString('base64'),
+              keyVersion: newer,
+              contentType: null,
+              updatedAt: new Date(newer).toISOString(),
+            },
+          },
+        }),
+      );
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+      const slowAdapter = {
+        read: async (spaceId: string, resourceKey: string) => {
+          if (resourceKey.startsWith('blocks/')) await sleep(200);
+          return store.get(`${spaceId}/${resourceKey}`) ?? null;
+        },
+        write: async () => ({ etag: 'x' }),
+        delete: async () => {},
+        list: async () => [],
+        getCapabilities: () => ({
+          targetBlockBytes: 100 * 1024,
+          conditionalWrites: true,
+          lockStrategy: 'pessimistic',
+          dictLockLeaseMs: 30_000,
+          blockLockLeaseMs: 120_000,
+        }),
+      } as never;
+      const config = configFor({
+        persistence: {
+          readTimeoutMs: 30,
+          readRetrySpacingMs: 10,
+          backgroundMaxAttempts: 20,
+          backgroundMaxElapsedMs: 5000,
+        },
+      });
+      const svc = new StorageEngineService(
+        orm.em.fork(),
+        config,
+        new FlushScheduler(config),
+        undefined,
+        slowAdapter,
+        new DictionaryCache(),
+      );
+      // Fallback serves the stale row immediately despite the slow block.
+      const fallback = await svc.readKey({ ownerId, spaceId: space.id, key: 'k' });
+      expect(fallback.value.toString()).toBe('v1');
+      // Background continuation pulls the newer version shortly after.
+      let current = fallback;
+      for (let i = 0; i < 100 && current.version !== newer; i += 1) {
+        await sleep(50);
+        current = await svc.readKey({ ownerId, spaceId: space.id, key: 'k' });
+      }
+      expect(current.value.toString()).toBe('v2');
+    }, 15000);
+
+    it('singleflights concurrent block reads', async () => {
+      const space = await service.createSpace(ownerId, 'Singleflight');
+      const version = Date.now() + 5000;
+      const store = new Map<string, Buffer>();
+      let blockReads = 0;
+      const seedBoth = () => {
+        store.set(
+          `${space.id}/blocks/blk_1`,
+          serializeBlock({
+            format: BLOCK_FORMAT,
+            blockId: 'blk_1',
+            entries: {
+              k1: { value: Buffer.from('v1').toString('base64'), keyVersion: version, contentType: null, updatedAt: new Date(version).toISOString() },
+              k2: { value: Buffer.from('v2').toString('base64'), keyVersion: version, contentType: null, updatedAt: new Date(version).toISOString() },
+            },
+          }),
+        );
+        store.set(
+          `${space.id}/dictionary`,
+          serializeDictionary({
+            format: DICTIONARY_FORMAT,
+            dictionaryVersion: 1,
+            entries: {
+              k1: { blockId: 'blk_1', keyVersion: version },
+              k2: { blockId: 'blk_1', keyVersion: version },
+            },
+            blocks: { blk_1: { keyCount: 2, liveBytes: 20 } },
+          }),
+        );
+      };
+      seedBoth();
+      const config = configFor();
+      const svc = new StorageEngineService(
+        orm.em.fork(),
+        config,
+        new FlushScheduler(config),
+        undefined,
+        {
+          read: async (spaceId: string, resourceKey: string) => {
+            if (resourceKey.startsWith('blocks/')) {
+              blockReads += 1;
+              await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+            return store.get(`${spaceId}/${resourceKey}`) ?? null;
+          },
+          write: async () => ({ etag: 'x' }),
+          delete: async () => {},
+          list: async () => [],
+          getCapabilities: () => ({
+            targetBlockBytes: 100 * 1024,
+            conditionalWrites: true,
+            lockStrategy: 'pessimistic',
+            dictLockLeaseMs: 30_000,
+            blockLockLeaseMs: 120_000,
+          }),
+        } as never,
+        new DictionaryCache(),
+      );
+      const [r1, r2] = await Promise.all([
+        svc.readKey({ ownerId, spaceId: space.id, key: 'k1' }),
+        svc.readKey({ ownerId, spaceId: space.id, key: 'k2' }),
+      ]);
+      expect(r1.value.toString()).toBe('v1');
+      expect(r2.value.toString()).toBe('v2');
+      expect(blockReads).toBe(1);
+    }, 15000);
+
+    it('pulls Gap-1 deletions inline on read', async () => {
+      const space = await service.createSpace(ownerId, 'Gap1Read');
+      const written = await service.writeKey({
+        ownerId,
+        spaceId: space.id,
+        key: 'gone',
+        value: Buffer.from('x'),
+      });
+      const store = new Map<string, Buffer>();
+      store.set(
+        `${space.id}/dictionary`,
+        serializeDictionary({
+          format: DICTIONARY_FORMAT,
+          dictionaryVersion: 1,
+          entries: {},
+          blocks: {},
+        }),
+      );
+      const config = configFor();
+      const svc = new StorageEngineService(
+        orm.em.fork(),
+        config,
+        new FlushScheduler(config),
+        undefined,
+        {
+          read: async (spaceId: string, resourceKey: string) =>
+            store.get(`${spaceId}/${resourceKey}`) ?? null,
+          write: async () => ({ etag: 'x' }),
+          delete: async () => {},
+          list: async () => [],
+          getCapabilities: () => ({
+            targetBlockBytes: 100 * 1024,
+            conditionalWrites: true,
+            lockStrategy: 'pessimistic',
+            dictLockLeaseMs: 30_000,
+            blockLockLeaseMs: 120_000,
+          }),
+        } as never,
+        new DictionaryCache(),
+      );
+      // Dirty row the medium never saw: served, not deleted.
+      const served = await svc.readKey({ ownerId, spaceId: space.id, key: 'gone' });
+      expect(served.value.toString()).toBe('x');
+      // Once clean, the absent entry pulls the deletion: 404 + row gone.
+      const dirty = await svc.listDirtyKeys(space.id);
+      expect(await svc.markKeyPersisted(dirty[0].id, written.version)).toBe(true);
+      await expect(
+        svc.readKey({ ownerId, spaceId: space.id, key: 'gone' }),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(await svc.listKeyVersions(space.id)).toHaveLength(0);
     });
   });
 });

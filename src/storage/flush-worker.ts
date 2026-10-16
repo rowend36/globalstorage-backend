@@ -1,7 +1,7 @@
-import { randomUUID } from 'node:crypto';
 import { ConflictException, Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { StorageEngineService } from '../engine/engine.service';
+import { INSTANCE_ID } from '../engine/instance';
+import { StorageEngineService, type DirtyKey } from '../engine/engine.service';
 import { FlushScheduler } from '../engine/flush-scheduler';
 import type { FlushHandler } from '../engine/ports';
 import type { AppConfig } from '../config/configuration';
@@ -19,16 +19,23 @@ import {
   type BlockFile,
   type DictionaryFile,
 } from './formats';
-import { MediumLockService } from './medium-locks';
+import { MediumLockService, needsRenew } from './medium-locks';
 
-/** Leases must cover debounce plus the apply phase; renewed past half-life. */
-const LOCK_LEASE_MS = 120_000;
+/** Reconcile discovery, returned for the future watch layer (logged for now). */
+export interface ChangeEvent {
+  spaceId: string;
+  key: string;
+  oldVersion: number | null;
+  newVersion: number;
+  operation: 'upsert' | 'delete';
+}
 
 interface HeldLock {
   resource: string;
   owner: string;
   fence: string;
   acquiredAt: number;
+  leaseMs: number;
 }
 
 /** Internal unwind: space marked unhealthy, flush ends without reschedule. */
@@ -44,8 +51,9 @@ class AbortFlush extends Error {}
 @Injectable()
 export class FlushWorker implements FlushHandler, OnModuleInit {
   private readonly logger = new Logger(FlushWorker.name);
-  private readonly ownerId = randomUUID();
+  private readonly ownerId = INSTANCE_ID;
   private readonly lastSyncAt = new Map<string, number>();
+  private readonly lastChanges = new Map<string, ChangeEvent[]>();
 
   constructor(
     private readonly engine: StorageEngineService,
@@ -88,9 +96,12 @@ export class FlushWorker implements FlushHandler, OnModuleInit {
   /**
    * Wipe a deleted space's medium prefix. Called after the engine removed
    * the rows. Fails with 409 while a flush holds the dictionary lock.
+   * Lock files vanish with the prefix wipe itself (data deletion, not
+   * lifecycle release).
    */
   async purgeSpace(spaceId: string): Promise<void> {
-    const fence = await this.locks.acquire(spaceId, 'dictionary', this.ownerId, LOCK_LEASE_MS);
+    const caps = this.adapter.getCapabilities();
+    const fence = await this.locks.acquire(spaceId, 'dictionary', this.ownerId, caps.dictLockLeaseMs);
     if (!fence) throw new ConflictException('Space is busy; retry the delete');
     try {
       const keys = await this.adapter.list(spaceId, '');
@@ -100,10 +111,35 @@ export class FlushWorker implements FlushHandler, OnModuleInit {
       ];
       for (const key of dataFirst) await this.adapter.delete(spaceId, key);
     } finally {
-      await this.locks.releaseResource(spaceId, 'dictionary', this.ownerId);
       this.cache.invalidate(spaceId);
       this.lastSyncAt.delete(spaceId);
+      this.lastChanges.delete(spaceId);
     }
+  }
+
+  /** Most recent reconcile discoveries, for observability and future watch. */
+  getLastChanges(spaceId: string): ChangeEvent[] {
+    return this.lastChanges.get(spaceId) ?? [];
+  }
+
+  private lockConfig(space: { providerConfig: Record<string, unknown> | null }): {
+    dictLeaseMs: number;
+    blockLeaseMs: number;
+    targetBytes: number;
+  } {
+    const caps = this.adapter.getCapabilities();
+    const override = (space.providerConfig ?? {}) as {
+      targetBlockBytes?: unknown;
+      dictLockLeaseMs?: unknown;
+      blockLockLeaseMs?: unknown;
+    };
+    const positive = (value: unknown, fallback: number): number =>
+      typeof value === 'number' && value > 0 ? Math.floor(value) : fallback;
+    return {
+      dictLeaseMs: positive(override.dictLockLeaseMs, caps.dictLockLeaseMs),
+      blockLeaseMs: positive(override.blockLockLeaseMs, caps.blockLockLeaseMs),
+      targetBytes: positive(override.targetBlockBytes, caps.targetBlockBytes),
+    };
   }
 
   private async flushSpace(spaceId: string): Promise<'done' | 'retry'> {
@@ -113,130 +149,231 @@ export class FlushWorker implements FlushHandler, OnModuleInit {
       this.logger.warn(`Skipping flush for unhealthy space ${spaceId}`);
       return 'done';
     }
-    const configured = (space.providerConfig as { targetBlockBytes?: unknown } | null)
-      ?.targetBlockBytes;
-    const targetBytes =
-      typeof configured === 'number' && configured > 0
-        ? Math.floor(configured)
-        : this.adapter.getCapabilities().targetBlockBytes;
+    const { dictLeaseMs, blockLeaseMs, targetBytes } = this.lockConfig(space);
 
+    // Adopt pre-locks up front (dict-free renew-verify). Survivors feed
+    // both paths; the registry is consumed either way.
+    const adopted = await this.adoptPreLocks(spaceId, blockLeaseMs);
+
+    // Fast path needs dirty keys; an idle flush still runs the structural
+    // path so cooldown-gated reconcile (Gap-1 deletes, pulls) happens.
+    const dirty = await this.engine.listDirtyKeys(spaceId);
+    if (dirty.length > 0 && (await this.tryFastPath(spaceId, dirty, targetBytes, adopted))) {
+      return 'done';
+    }
+    return this.structuralFlush(spaceId, space, targetBytes, dictLeaseMs, blockLeaseMs, adopted);
+  }
+
+  /**
+   * Adopt registry pre-locks into the worker lease, dropping the rest.
+   * Renewal (not re-acquire) verifies they are still ours; failures are
+   * dropped (re-acquired fresh below if still needed). Returns blockId →
+   * hold with precise lease windows for ensureHeld.
+   */
+  private async adoptPreLocks(
+    spaceId: string,
+    blockLeaseMs: number,
+  ): Promise<Map<string, { owner: string; fence: string; acquiredAt: number; leaseMs: number }>> {
+    const adopted = new Map<string, { owner: string; fence: string; acquiredAt: number; leaseMs: number }>();
+    for (const pre of this.engine.consumePreLocks(spaceId)) {
+      const ok = await this.locks.renew(
+        spaceId,
+        `block/${pre.blockId}`,
+        pre.owner,
+        pre.fence,
+        blockLeaseMs,
+      );
+      if (!ok) continue;
+      adopted.set(pre.blockId, { owner: pre.owner, fence: pre.fence, acquiredAt: Date.now(), leaseMs: blockLeaseMs });
+    }
+    return adopted;
+  }
+
+  /**
+   * Fast path: no dictionary file read, no dict lock, no reconcile, no
+   * publish. Valid only when the cached mapping covers every dirty key
+   * with no structural need (no tombstones, no moves, no new blocks, no
+   * deletes), the cooldown is fresh, versions gate pass, and every needed
+   * block is already held. Anything else falls through to structural.
+   */
+  private async tryFastPath(
+    spaceId: string,
+    dirty: DirtyKey[],
+    targetBytes: number,
+    adopted: Map<string, { owner: string; fence: string; acquiredAt: number; leaseMs: number }>,
+  ): Promise<boolean> {
+    const cached = this.cache.get(spaceId);
+    if (!cached) return false;
+    const cooldown = this.config.get('persistence', { infer: true }).syncCooldownMs;
+    const lastSync = this.lastSyncAt.get(spaceId) ?? 0;
+    if (Date.now() - lastSync >= cooldown) return false;
+    if (dirty.some((row) => row.deleted)) return false;
+    const entries = cached.dictionary.entries;
+    for (const row of dirty) {
+      const entry = entries[row.key];
+      if (!entry || entry.keyVersion > row.version) return false;
+    }
+    const plan = this.blocks.planLayout(cached.dictionary, dirty, targetBytes);
+    if (plan.deleteBlocks.length > 0) return false;
+    const needed: string[] = [];
+    for (const delta of plan.deltas) {
+      if (delta.isNew) return false;
+      for (const row of delta.upserts) {
+        if (entries[row.key]?.blockId !== delta.blockId) return false;
+      }
+      if (!adopted.has(delta.blockId)) return false;
+      needed.push(delta.blockId);
+    }
+    const held: HeldLock[] = needed.map((blockId) => {
+      const lock = adopted.get(blockId) as { owner: string; fence: string; acquiredAt: number; leaseMs: number };
+      return {
+        resource: `block/${blockId}`,
+        owner: lock.owner,
+        fence: lock.fence,
+        acquiredAt: lock.acquiredAt,
+        leaseMs: lock.leaseMs,
+      };
+    });
+    for (const delta of plan.deltas) {
+      if (!(await this.ensureHeld(spaceId, held))) return false;
+      const old = await this.readBlockFile(spaceId, delta.blockId);
+      let rebuild = new Map<string, { value: Buffer; version: number; contentType: string | null }>();
+      if (!old) {
+        rebuild = await this.rebuildValues(spaceId, delta.blockId, cached.dictionary, delta.removes);
+      }
+      const renderedBlock = this.blocks.renderBlock(delta, old, rebuild);
+      await this.adapter.write(spaceId, `blocks/${delta.blockId}`, renderedBlock.bytes);
+    }
+    for (const row of dirty) {
+      await this.engine.markKeyPersisted(row.id, row.version);
+    }
+    return true;
+  }
+
+  /**
+   * Structural path: dict lock, fresh dictionary, reconcile, plan with
+   * moves/creates/deletes, publish. Lapse-based lifecycle throughout —
+   * nothing is explicitly released (stale pre-locks were already dropped
+   * at adoption; the purge wipe handles deletion).
+   */
+  private async structuralFlush(
+    spaceId: string,
+    space: { providerConfig: Record<string, unknown> | null },
+    targetBytes: number,
+    dictLeaseMs: number,
+    blockLeaseMs: number,
+    adopted: Map<string, { owner: string; fence: string; acquiredAt: number; leaseMs: number }>,
+  ): Promise<'done' | 'retry'> {
     const dictFence = await this.locks.acquire(
       spaceId,
       'dictionary',
       this.ownerId,
-      LOCK_LEASE_MS,
+      dictLeaseMs,
     );
     if (!dictFence) return 'retry';
     const held: HeldLock[] = [
-      { resource: 'dictionary', owner: this.ownerId, fence: dictFence, acquiredAt: Date.now() },
+      {
+        resource: 'dictionary',
+        owner: this.ownerId,
+        fence: dictFence,
+        acquiredAt: Date.now(),
+        leaseMs: dictLeaseMs,
+      },
     ];
-    try {
-      let dictionary = await this.readDictionary(spaceId);
-      if (!dictionary) {
-        // No dictionary: medium state unknown. Requeue everything so no
-        // row claiming persisted status is silently missing outside.
-        await this.engine.requeueSpace(spaceId);
-      }
-
-      const cooldown = this.config.get('persistence', { infer: true }).syncCooldownMs;
-      const lastSync = this.lastSyncAt.get(spaceId) ?? 0;
-      if (dictionary && Date.now() - lastSync >= cooldown) {
-        await this.reconcile(spaceId, dictionary);
-        this.lastSyncAt.set(spaceId, Date.now());
-        this.cache.set(spaceId, dictionary);
-      }
-
-      const dirty = await this.engine.listDirtyKeys(spaceId);
-      if (dirty.length === 0) return 'done';
-
-      const plan = this.blocks.planLayout(dictionary, dirty, targetBytes);
-
-      // Fold pre-locks: adopt needed blocks by renewing them into the
-      // worker lease (verifies they are still ours), release the rest.
-      const needed = [...new Set(plan.deltas.map((delta) => delta.blockId))].sort();
-      const heldBlocks = new Map<string, { owner: string; fence: string }>();
-      for (const pre of this.engine.consumePreLocks(spaceId)) {
-        if (!needed.includes(pre.blockId)) {
-          await this.locks.release(spaceId, pre.blockId, pre.owner);
-          continue;
-        }
-        const adopted = await this.locks.renew(
-          spaceId,
-          `block/${pre.blockId}`,
-          pre.owner,
-          pre.fence,
-          LOCK_LEASE_MS,
-        );
-        if (!adopted) continue;
-        heldBlocks.set(pre.blockId, { owner: pre.owner, fence: pre.fence });
-        held.push({
-          resource: `block/${pre.blockId}`,
-          owner: pre.owner,
-          fence: pre.fence,
-          acquiredAt: Date.now(),
-        });
-      }
-      for (const blockId of needed) {
-        if (heldBlocks.has(blockId)) continue;
-        const fence = await this.locks.acquire(
-          spaceId,
-          `block/${blockId}`,
-          this.ownerId,
-          LOCK_LEASE_MS,
-        );
-        if (!fence) return 'retry';
-        heldBlocks.set(blockId, { owner: this.ownerId, fence });
-        held.push({
-          resource: `block/${blockId}`,
-          owner: this.ownerId,
-          fence,
-          acquiredAt: Date.now(),
-        });
-      }
-
-      const rendered = new Map<string, RenderedBlock>();
-      for (const delta of plan.deltas) {
-        if (!(await this.ensureHeld(spaceId, held))) return 'retry';
-        const old = await this.readBlockFile(spaceId, delta.blockId);
-        let rebuild = new Map<string, { value: Buffer; version: number; contentType: string | null }>();
-        if (!old && !delta.isNew) {
-          rebuild = await this.rebuildValues(spaceId, delta.blockId, dictionary, delta.removes);
-        }
-        const renderedBlock = this.blocks.renderBlock(delta, old, rebuild);
-        rendered.set(delta.blockId, renderedBlock);
-        await this.adapter.write(spaceId, `blocks/${delta.blockId}`, renderedBlock.bytes);
-      }
-      for (const gone of plan.deleteBlocks) {
-        await this.adapter.delete(spaceId, `blocks/${gone}`);
-      }
-      const previousBlocks = Object.fromEntries(
-        Object.entries(dictionary?.blocks ?? {}).filter(([blockId]) => !plan.deleteBlocks.includes(blockId)),
-      );
-      const nextDictionary = this.blocks.buildDictionary(
-        dictionary?.dictionaryVersion ?? 0,
-        plan.entries,
-        rendered,
-        previousBlocks,
-      );
-      if (!(await this.ensureHeld(spaceId, held))) return 'retry';
-      const dictionaryBytes = serializeDictionary(nextDictionary);
-      await this.adapter.write(spaceId, 'dictionary', dictionaryBytes);
-      this.cache.set(spaceId, parseDictionary(dictionaryBytes));
-      this.lastSyncAt.set(spaceId, Date.now());
-
-      for (const row of dirty) {
-        // Guarded ops: a concurrently revived key misses its version
-        // match (stays dirty for the next flush); a concurrently deleted
-        // key is already a tombstone (purge is a no-op for live rows).
-        if (row.deleted) await this.engine.purgeTombstone(row.id);
-        else await this.engine.markKeyPersisted(row.id, row.version);
-      }
-      return 'done';
-    } finally {
-      for (const lock of held) {
-        await this.locks.releaseResource(spaceId, lock.resource, lock.owner);
-      }
+    let dictionary = await this.readDictionary(spaceId);
+    if (!dictionary) {
+      // No dictionary: medium state unknown. Requeue everything so no
+      // row claiming persisted status is silently missing outside.
+      await this.engine.requeueSpace(spaceId);
     }
+
+    const cooldown = this.config.get('persistence', { infer: true }).syncCooldownMs;
+    const lastSync = this.lastSyncAt.get(spaceId) ?? 0;
+    if (dictionary && Date.now() - lastSync >= cooldown) {
+      const events = await this.reconcile(spaceId, dictionary);
+      this.lastChanges.set(spaceId, events);
+      this.lastSyncAt.set(spaceId, Date.now());
+      this.cache.set(spaceId, dictionary);
+      this.engine.clearNeedsResync(spaceId);
+    }
+
+    const fresh = await this.engine.listDirtyKeys(spaceId);
+    if (fresh.length === 0) return 'done';
+
+    const plan = this.blocks.planLayout(dictionary, fresh, targetBytes);
+    const needed = [...new Set(plan.deltas.map((delta) => delta.blockId))].sort();
+    const heldBlocks = new Map<string, { owner: string; fence: string; acquiredAt: number; leaseMs: number }>();
+    for (const [blockId, lock] of adopted) {
+      if (!needed.includes(blockId)) continue;
+      heldBlocks.set(blockId, lock);
+      held.push({
+        resource: `block/${blockId}`,
+        owner: lock.owner,
+        fence: lock.fence,
+        acquiredAt: lock.acquiredAt,
+        leaseMs: lock.leaseMs,
+      });
+    }
+    for (const blockId of needed) {
+      if (heldBlocks.has(blockId)) continue;
+      const fence = await this.locks.acquire(
+        spaceId,
+        `block/${blockId}`,
+        this.ownerId,
+        blockLeaseMs,
+      );
+      if (!fence) return 'retry';
+      heldBlocks.set(blockId, { owner: this.ownerId, fence, acquiredAt: Date.now(), leaseMs: blockLeaseMs });
+      held.push({
+        resource: `block/${blockId}`,
+        owner: this.ownerId,
+        fence,
+        acquiredAt: Date.now(),
+        leaseMs: blockLeaseMs,
+      });
+    }
+
+    const rendered = new Map<string, RenderedBlock>();
+    for (const delta of plan.deltas) {
+      if (!(await this.ensureHeld(spaceId, held))) return 'retry';
+      const old = await this.readBlockFile(spaceId, delta.blockId);
+      let rebuild = new Map<string, { value: Buffer; version: number; contentType: string | null }>();
+      if (!old && !delta.isNew) {
+        rebuild = await this.rebuildValues(spaceId, delta.blockId, dictionary, delta.removes);
+      }
+      const renderedBlock = this.blocks.renderBlock(delta, old, rebuild);
+      rendered.set(delta.blockId, renderedBlock);
+      await this.adapter.write(spaceId, `blocks/${delta.blockId}`, renderedBlock.bytes);
+    }
+    for (const gone of plan.deleteBlocks) {
+      await this.adapter.delete(spaceId, `blocks/${gone}`);
+    }
+    const previousBlocks = Object.fromEntries(
+      Object.entries(dictionary?.blocks ?? {}).filter(([blockId]) => !plan.deleteBlocks.includes(blockId)),
+    );
+    const nextDictionary = this.blocks.buildDictionary(
+      dictionary?.dictionaryVersion ?? 0,
+      plan.entries,
+      rendered,
+      previousBlocks,
+    );
+    if (!(await this.ensureHeld(spaceId, held))) return 'retry';
+    const dictionaryBytes = serializeDictionary(nextDictionary);
+    await this.adapter.write(spaceId, 'dictionary', dictionaryBytes);
+    this.cache.set(spaceId, parseDictionary(dictionaryBytes));
+    this.lastSyncAt.set(spaceId, Date.now());
+
+    for (const row of fresh) {
+      // Guarded ops: a concurrently revived key misses its version
+      // match (stays dirty for the next flush); a concurrently deleted
+      // key is already a tombstone (purge is a no-op for live rows).
+      if (row.deleted) await this.engine.purgeTombstone(row.id);
+      else await this.engine.markKeyPersisted(row.id, row.version);
+    }
+    return 'done';
+    // NOTE: no finally-release — lapse-based lifecycle. Locks expire on
+    // their own; purge wipe and stale-prelock drops are the only explicit
+    // deletions. Releasing here would churn acquisitions on slow media.
   }
 
   private async readDictionary(spaceId: string): Promise<DictionaryFile | null> {
@@ -296,7 +433,8 @@ export class FlushWorker implements FlushHandler, OnModuleInit {
     return found;
   }
 
-  private async reconcile(spaceId: string, dictionary: DictionaryFile): Promise<void> {
+  private async reconcile(spaceId: string, dictionary: DictionaryFile): Promise<ChangeEvent[]> {
+    const events: ChangeEvent[] = [];
     const local = await this.engine.listKeyVersions(spaceId);
     const localByKey = new Map(local.map((row) => [row.key, row]));
     for (const [key, entry] of Object.entries(dictionary.entries)) {
@@ -318,33 +456,51 @@ export class FlushWorker implements FlushHandler, OnModuleInit {
         continue; // Corrupt block: push path rebuilds it from local rows.
       }
       if (!envelope || envelope.keyVersion !== entry.keyVersion) continue;
-      await this.engine.upsertFromMedium(spaceId, key, {
+      const { applied } = await this.engine.upsertFromMedium(spaceId, key, {
         value: Buffer.from(envelope.value, 'base64'),
         version: envelope.keyVersion,
         contentType: envelope.contentType,
       });
+      if (applied) {
+        events.push({
+          spaceId,
+          key,
+          oldVersion: row?.version ?? null,
+          newVersion: envelope.keyVersion,
+          operation: 'upsert',
+        });
+      }
     }
     for (const row of local) {
-      if (!dictionary.entries[row.key]) await this.engine.deleteLocalRow(spaceId, row.key);
+      if (!dictionary.entries[row.key]) {
+        const deleted = await this.engine.deleteLocalRow(spaceId, row.key);
+        if (deleted) {
+          events.push({ spaceId, key: row.key, oldVersion: row.version, newVersion: row.version, operation: 'delete' });
+        }
+      }
     }
+    if (events.length > 0) {
+      this.logger.debug(`Reconciled ${spaceId}: ${events.length} change(s) pulled`);
+    }
+    return events;
   }
 
   /**
-   * Verify every held lock still carries our fence, renewing past
-   * half-lease. Returns false when a lock was lost (caller reschedules).
-   * Sound: a lock cannot be stolen while our lease is valid, and any
-   * steal replaces the fence — so fence-match plus a timely renew is
-   * sufficient. (Cross-instance clock skew is a documented limitation.)
+   * Verify every held lock still carries our fence, renewing inside the
+   * proportional margin (no dict lock needed — renewal resolves
+   * nothing). Returns false when a lock was lost (caller reschedules).
+   * Local-validity fast path first: comfortably-valid leases cost zero
+   * medium IO. (Cross-instance clock skew is a documented limitation.)
    */
   private async ensureHeld(spaceId: string, held: HeldLock[]): Promise<boolean> {
     for (const lock of held) {
-      if (Date.now() - lock.acquiredAt < LOCK_LEASE_MS / 2) continue;
+      if (!needsRenew(lock.acquiredAt, lock.leaseMs, Date.now())) continue;
       const renewed = await this.locks.renew(
         spaceId,
         lock.resource,
         lock.owner,
         lock.fence,
-        LOCK_LEASE_MS,
+        lock.leaseMs,
       );
       if (!renewed) return false;
       lock.acquiredAt = Date.now();

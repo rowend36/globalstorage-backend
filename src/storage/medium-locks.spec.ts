@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DictionaryCache } from './dictionary-cache';
+import { MediumLockService, needsRenew } from './medium-locks';
 import {
   LOCK_FORMAT,
   emptyDictionary,
@@ -10,7 +11,20 @@ import {
   serializeLock,
 } from './formats';
 import { LocalFilesystemAdapter } from './local-filesystem.adapter';
-import { MediumLockService } from './medium-locks';
+
+describe('needsRenew', () => {
+  it('renews inside a proportional margin with a floor', () => {
+    // 120s lease → 30s margin (25%).
+    expect(needsRenew(0, 120_000, 89_000)).toBe(false);
+    expect(needsRenew(0, 120_000, 91_000)).toBe(true);
+    // 30s lease → 7.5s margin (25% beats the 5s floor).
+    expect(needsRenew(0, 30_000, 22_000)).toBe(false);
+    expect(needsRenew(0, 30_000, 23_000)).toBe(true);
+    // 10s lease → 5s floor beats 2.5s proportional.
+    expect(needsRenew(0, 10_000, 4_000)).toBe(false);
+    expect(needsRenew(0, 10_000, 6_000)).toBe(true);
+  });
+});
 
 describe('MediumLockService', () => {
   let dir: string;

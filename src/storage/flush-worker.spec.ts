@@ -276,4 +276,106 @@ describe('FlushWorker', () => {
     expect(await readDictionaryVersion(space.id)).toBe(2);
     expect((await engine.getStatus(ownerId, space.id)).pendingKeys).toBe(0);
   });
+
+  it('retains locks after flush instead of releasing them', async () => {
+    const space = await engine.createSpace(ownerId, 'Retain');
+    await engine.writeKey({ ownerId, spaceId: space.id, key: 'k', value: Buffer.from('v') });
+    await worker.handle([space.id]);
+    // Lapse-based lifecycle: lock files remain for their lease instead of
+    // being deleted at flush end.
+    const lockFiles = await adapter.list(space.id, 'locks');
+    expect(lockFiles.length).toBeGreaterThan(0);
+    expect((await engine.getStatus(ownerId, space.id)).pendingKeys).toBe(0);
+  });
+
+  it('takes the fast path when all blocks are held and nothing structural changed', async () => {
+    const bigCooldown = {
+      get: (key: string) =>
+        key === 'persistence'
+          ? { ...(valuesFor(key) as object), directory: tmp, syncCooldownMs: 60_000 }
+          : valuesFor(key),
+    } as never;
+    const localScheduler = new FlushScheduler(bigCooldown);
+    const cache = new DictionaryCache();
+    const realLocks = new MediumLockService(adapter, cache);
+    const localEngine = new StorageEngineService(
+      orm.em.fork(),
+      bigCooldown,
+      localScheduler,
+      realLocks as never,
+      adapter,
+      cache,
+    );
+    const localWorker = new FlushWorker(
+      localEngine,
+      adapter,
+      realLocks,
+      cache,
+      new BlockManager(),
+      localScheduler,
+      bigCooldown,
+    );
+    const space = await localEngine.createSpace(ownerId, 'Fast');
+    await localEngine.writeKey({ ownerId, spaceId: space.id, key: 'a', value: Buffer.from('1') });
+    await localEngine.writeKey({ ownerId, spaceId: space.id, key: 'b', value: Buffer.from('2') });
+    await localWorker.handle([space.id]);
+    const before = await adapter.read(space.id, 'dictionary');
+    expect(before).not.toBeNull();
+
+    // Rewrite in place: same keys, fitting values → no dict touch.
+    await localEngine.writeKey({ ownerId, spaceId: space.id, key: 'a', value: Buffer.from('3') });
+    await localWorker.handle([space.id]);
+    expect(await adapter.read(space.id, 'dictionary')).toEqual(before);
+    expect((await localEngine.getStatus(ownerId, space.id)).pendingKeys).toBe(0);
+    const read = await localEngine.readKey({ ownerId, spaceId: space.id, key: 'a' });
+    expect(read.value.toString()).toBe('3');
+    await localScheduler.onModuleDestroy();
+  });
+
+  it('reports reconcile discoveries as change events', async () => {
+    const space = await engine.createSpace(ownerId, 'Events');
+    const written = await engine.writeKey({
+      ownerId,
+      spaceId: space.id,
+      key: 'k',
+      value: Buffer.from('local'),
+    });
+    const newer = written.version + 1000;
+    await adapter.write(
+      space.id,
+      'blocks/blk_e',
+      serializeBlock({
+        format: BLOCK_FORMAT,
+        blockId: 'blk_e',
+        entries: {
+          k: {
+            value: Buffer.from('remote').toString('base64'),
+            keyVersion: newer,
+            contentType: null,
+            updatedAt: new Date(newer).toISOString(),
+          },
+        },
+      }),
+    );
+    await adapter.write(
+      space.id,
+      'dictionary',
+      serializeDictionary({
+        format: DICTIONARY_FORMAT,
+        dictionaryVersion: 1,
+        entries: { k: { blockId: 'blk_e', keyVersion: newer } },
+        blocks: { blk_e: { keyCount: 1, liveBytes: 50 } },
+      }),
+    );
+    await worker.handle([space.id]);
+    expect(worker.getLastChanges(space.id)).toEqual([
+      {
+        spaceId: space.id,
+        key: 'k',
+        oldVersion: written.version,
+        newVersion: newer,
+        operation: 'upsert',
+      },
+    ]);
+  });
 });

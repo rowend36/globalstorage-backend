@@ -12,11 +12,19 @@
 
 export const STORAGE_ADAPTER = Symbol('StorageAdapter');
 
+export type LockStrategy = 'pessimistic' | 'optimistic';
+
 export interface StorageCapabilities {
   /** Packing target for blocks; configurable per storage type. */
   targetBlockBytes: number;
   /** Whether conditional writes are enforced by the medium. */
   conditionalWrites: boolean;
+  /** Acquisition discipline for block locks outside the flush publish. */
+  lockStrategy: LockStrategy;
+  /** Lease for dictionary locks (one plan+publish window). */
+  dictLockLeaseMs: number;
+  /** Lease for block locks (debounce+flush+refresh retention). */
+  blockLockLeaseMs: number;
 }
 
 export interface StorageWriteOptions {

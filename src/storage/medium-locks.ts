@@ -17,6 +17,15 @@ import {
 import { DictionaryCache } from './dictionary-cache';
 
 /**
+ * Renewal policy: renew when the remaining lease drops below a
+ * proportional margin with a floor — longer leases imply costlier media,
+ * so renew earlier. Pure function for deterministic testing.
+ */
+export function needsRenew(acquiredAt: number, leaseMs: number, now: number): boolean {
+  return now - acquiredAt > leaseMs - Math.max(leaseMs * 0.25, 5000);
+}
+
+/**
  * Pessimistic locks as medium resources (`locks/<resource>`), so every
  * conformant instance sharing the storage can see them. Lock files carry
  * owner, fencing token, and lease expiry; a holder whose lease lapses
@@ -157,7 +166,12 @@ export class MediumLockService implements BlockLockPort {
   }
 
   // ------------------------------------------------------- BlockLockPort
-  // Pre-lock surface for the engine: block-scoped views of the above.
+  // Pre-lock surface for the engine: block-scoped views of the above,
+  // plus dictionary acquisition for dict-first ordering.
+
+  async acquireDictionary(spaceId: string, owner: string, leaseMs: number): Promise<string | null> {
+    return this.acquire(spaceId, 'dictionary', owner, leaseMs);
+  }
 
   async tryAcquire(
     spaceId: string,

@@ -55,6 +55,12 @@ describe('LocalFilesystemAdapter', () => {
     await expect(adapter.read('..', 'dictionary')).rejects.toThrow();
     await expect(adapter.read('sp_1', '../other')).rejects.toThrow();
     await expect(adapter.read('sp_1', '')).rejects.toThrow();
-    expect(adapter.getCapabilities()).toEqual({ targetBlockBytes: 100 * 1024, conditionalWrites: true });
+    expect(adapter.getCapabilities()).toEqual({
+      targetBlockBytes: 100 * 1024,
+      conditionalWrites: true,
+      lockStrategy: 'pessimistic',
+      dictLockLeaseMs: 30_000,
+      blockLockLeaseMs: 120_000,
+    });
   });
 });

@@ -208,6 +208,26 @@ export const configuration = () => {
         process.env.PERSISTENCE_SYNC_COOLDOWN_MS,
         5000,
       ),
+      readTimeoutMs: number(
+        'PERSISTENCE_READ_TIMEOUT_MS',
+        process.env.PERSISTENCE_READ_TIMEOUT_MS,
+        1000,
+      ),
+      readRetrySpacingMs: number(
+        'PERSISTENCE_READ_RETRY_SPACING_MS',
+        process.env.PERSISTENCE_READ_RETRY_SPACING_MS,
+        100,
+      ),
+      backgroundMaxAttempts: number(
+        'PERSISTENCE_BACKGROUND_MAX_ATTEMPTS',
+        process.env.PERSISTENCE_BACKGROUND_MAX_ATTEMPTS,
+        10,
+      ),
+      backgroundMaxElapsedMs: number(
+        'PERSISTENCE_BACKGROUND_MAX_ELAPSED_MS',
+        process.env.PERSISTENCE_BACKGROUND_MAX_ELAPSED_MS,
+        30_000,
+      ),
     },
     mail: {
       provider: choice(

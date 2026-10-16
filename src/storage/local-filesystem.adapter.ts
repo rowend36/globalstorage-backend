@@ -29,7 +29,13 @@ export class LocalFilesystemAdapter implements StorageAdapter {
   }
 
   getCapabilities(): StorageCapabilities {
-    return { targetBlockBytes: 100 * 1024, conditionalWrites: true };
+    return {
+      targetBlockBytes: 100 * 1024,
+      conditionalWrites: true,
+      lockStrategy: 'pessimistic',
+      dictLockLeaseMs: 30_000,
+      blockLockLeaseMs: 120_000,
+    };
   }
 
   async read(spaceId: string, resourceKey: string): Promise<Buffer | null> {

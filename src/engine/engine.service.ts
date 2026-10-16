@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import {
   BadRequestException,
   Inject,
@@ -15,6 +14,7 @@ import { EntityManager, LockMode, raw, type EntityName } from '@mikro-orm/core';
 import type { SqlEntityManager } from '@mikro-orm/sql';
 import {
   STORAGE_ADAPTER,
+  type LockStrategy,
   type StorageAdapter,
 } from '../storage/storage-adapter.port';
 import { DictionaryCache } from '../storage/dictionary-cache';
@@ -22,13 +22,16 @@ import {
   StorageVersionError,
   parseBlock,
   parseDictionary,
+  type BlockFile,
 } from '../storage/formats';
+import { needsRenew } from '../storage/medium-locks';
 import {
   SpaceKeySchema,
   SpaceSchema,
   type Space,
 } from '../database/entities';
 import type { AppConfig } from '../config/configuration';
+import { INSTANCE_ID } from './instance';
 import {
   KeyVersionConflictException,
   QuotaExceededException,
@@ -40,8 +43,22 @@ import { BLOCK_LOCKS, type BlockLockPort } from './ports';
 const DEFAULT_LIST_LIMIT = 100;
 const MAX_LIST_LIMIT = 1000;
 const DIRTY_LIST_LIMIT = 1000;
-/** Pre-lock leases must cover the debounce window plus the flush apply. */
+/** Block pre-lock lease: must cover write→flush adoption; adoption converts. */
 const PRE_LOCK_LEASE_MS = 60_000;
+/**
+ * Dict-lock lease for pre-lock/read sequences: covers one
+ * resolve-and-acquire round with margin. Short on purpose — dict
+ * exclusion is space-global, so lapse (not explicit release) bounds it.
+ */
+const PRELOCK_DICT_LEASE_MS = 10_000;
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (typeof (timer as unknown as { unref?: unknown }).unref === 'function') {
+      (timer as unknown as { unref: () => void }).unref();
+    }
+  });
 
 export interface SpaceSummary {
   id: string;
@@ -139,6 +156,17 @@ interface PreLock {
 }
 
 /**
+ * Shared block-read outcome: a parsed file (lock retained for the
+ * caller), an unavailable block (busy/corrupt/missing — retryable), or
+ * a terminal version conflict (fail explicit, no retry).
+ */
+type SharedBlockRead =
+  | { status: 'ready'; blockId: string; fence: string; file: BlockFile }
+  | { status: 'busy' }
+  | { status: 'missing' }
+  | { status: 'terminal' };
+
+/**
  * The operational key-value engine. Reads and writes touch only the
  * `spaces` / `space_keys` tables — never blocks, dictionaries, or the
  * storage medium. Versions are timestamps (recency ordering); deletes
@@ -151,8 +179,22 @@ interface PreLock {
  */
 @Injectable()
 export class StorageEngineService {
-  private readonly instanceId = randomUUID();
+  private readonly instanceId = INSTANCE_ID;
   private readonly preLocks = new Map<string, Map<string, PreLock>>();
+  private readonly strategyCache = new Map<string, LockStrategy>();
+  private readonly dictAcquiring = new Map<string, Promise<string | null>>();
+  /** Dict-lock coverage per space (short-circuit re-acquisition while valid). */
+  private readonly dictHeldUntil = new Map<string, number>();
+  /**
+   * Spaces with a fresh (never reconciled-since) block hold. Serve-direct
+   * stays off for these — a lapse gap may have seen unseen publishes.
+   * Cleared by the worker after each successful reconcile.
+   */
+  private readonly needsResync = new Set<string>();
+  /** In-flight block reads, shared by attached readers and background refresh. */
+  private readonly inflightReads = new Map<string, Promise<SharedBlockRead>>();
+  /** Running background refresh loops, singleflighted per block. */
+  private readonly bgRefreshInFlight = new Map<string, Promise<void>>();
 
   constructor(
     private readonly em: EntityManager,
@@ -195,7 +237,7 @@ export class StorageEngineService {
     patch: { name?: string; quotaBytes?: number },
   ): Promise<SpaceSummary> {
     const { aggregateQuotaBytes } = this.config.get('spaces', { infer: true });
-    return this.em.transactional(async (tx) => {
+    const summary = await this.em.transactional(async (tx) => {
       const space = await this.loadSpaceForUpdate(tx, ownerId, spaceId);
       if (patch.name !== undefined) space.name = validateSpaceName(patch.name);
       if (patch.quotaBytes !== undefined) {
@@ -215,6 +257,10 @@ export class StorageEngineService {
       await tx.flush();
       return this.toSpaceSummary(space);
     });
+    // providerConfig is immutable via this endpoint today, but drop any
+    // cached strategy regardless so future patches cannot go stale.
+    this.strategyCache.delete(spaceId);
+    return summary;
   }
 
   async deleteSpace(ownerId: string, spaceId: string): Promise<{ id: string }> {
@@ -224,10 +270,35 @@ export class StorageEngineService {
       tx.remove(space);
       await tx.flush();
     });
-    // Medium-side prefix wipe is the flush worker's job (Phase 3, under
-    // the dict lock). Cancel any pending flush for the deleted space.
+    // Medium-side prefix wipe is the flush worker's job (under the dict
+    // lock). Cancel any pending flush and drop local per-space state.
     this.scheduler.cancel(spaceId);
+    this.preLocks.delete(spaceId);
+    this.strategyCache.delete(spaceId);
+    this.needsResync.delete(spaceId);
+    this.dictHeldUntil.delete(spaceId);
     return { id: spaceId };
+  }
+
+  /** Lock acquisition discipline per space (cached; safe default). */
+  async strategyFor(spaceId: string): Promise<LockStrategy> {
+    const cached = this.strategyCache.get(spaceId);
+    if (cached) return cached;
+    let strategy: LockStrategy = this.storage?.getCapabilities().lockStrategy ?? 'pessimistic';
+    try {
+      const space = await this.em.findOne(SpaceSchema, { id: spaceId });
+      const override = (space?.providerConfig as { lockStrategy?: unknown } | null)?.lockStrategy;
+      if (override === 'pessimistic' || override === 'optimistic') strategy = override;
+    } catch {
+      // Fall through with the safest default; the flush verifies anyway.
+    }
+    this.strategyCache.set(spaceId, strategy);
+    return strategy;
+  }
+
+  /** Cleared by the worker after each successful reconcile. */
+  clearNeedsResync(spaceId: string): void {
+    this.needsResync.delete(spaceId);
   }
 
   /** Internal state transition for the flush worker (Phase 3). */
@@ -304,13 +375,13 @@ export class StorageEngineService {
     const space = await this.loadSpace(input.ownerId, input.spaceId);
     const row = await this.em.findOne(SpaceKeySchema, { space: space.id, key: input.key });
     if (row && !row.deletedAt) {
-      // A present row is always authoritative for reads.
-      return {
-        value: Buffer.from(row.value),
-        contentType: row.contentType ?? null,
-        version: row.version,
-        updatedAt: row.updatedAt ?? null,
-      };
+      const direct = this.serveDirect(space.id, row);
+      if (direct) return direct;
+      if (!this.storage || !this.dictionaryCache) {
+        // No medium layer wired: the row is all we know (Phase-2 behavior).
+        return this.toReadResult(row);
+      }
+      return this.consultMedium(space.id, row);
     }
     // Tombstones read as deleted without consulting the medium
     // (read-your-deletes); the flush reconciles concurrent medium writes.
@@ -320,46 +391,160 @@ export class StorageEngineService {
   }
 
   /**
-   * Read-miss hydration: the key is absent locally but may live on the
-   * medium (another instance wrote it, or our rows were rebuilt). Pulls
-   * the envelope into a persisted row. Genuine 404 only when the key is
-   * in neither place; anything inconsistent fails explicitly (503).
+   * Zero-IO fast path: serve the row directly when its block is
+   * continuously held and no lapse gap is pending. The held lock pins
+   * the block's key set, so no newer medium state can exist for it.
    */
-  private async hydrateFromMedium(spaceId: string, key: string): Promise<ReadKeyResult> {
-    const storage = this.storage;
-    const cache = this.dictionaryCache;
-    if (!storage || !cache) throw new NotFoundException('Key not found');
-    let cached = cache.get(spaceId);
-    if (!cached) {
-      const rawDictionary = await storage.read(spaceId, 'dictionary');
-      if (!rawDictionary) throw new NotFoundException('Key not found');
-      try {
-        cache.set(spaceId, parseDictionary(rawDictionary));
-      } catch (error) {
-        if (error instanceof StorageVersionError) {
-          await this.setSpaceState(spaceId, 'unhealthy');
-          throw new ServiceUnavailableException('Stored data uses a newer format version');
-        }
-        throw new NotFoundException('Key not found');
-      }
-      cached = cache.get(spaceId);
-      if (!cached) throw new NotFoundException('Key not found');
-    }
-    const entry = cached.dictionary.entries[key];
-    if (!entry) throw new NotFoundException('Key not found');
-    const blockRaw = await storage.read(spaceId, `blocks/${entry.blockId}`);
-    if (!blockRaw) throw new ServiceUnavailableException('Key data unavailable');
-    let envelope;
+  private serveDirect(
+    spaceId: string,
+    row: {
+      key: string;
+      value: Buffer | Uint8Array;
+      contentType: string | null | undefined;
+      version: number;
+      updatedAt: Date | null | undefined;
+    },
+  ): ReadKeyResult | null {
+    if (this.needsResync.has(spaceId)) return null;
+    const blockId = this.dictionaryCache
+      ?.get(spaceId)?.dictionary.entries[row.key]?.blockId;
+    if (!blockId) return null;
+    if (!this.heldValid(spaceId, blockId)) return null;
+    return this.toReadResult(row);
+  }
+
+  private toReadResult(row: {
+    value: Buffer | Uint8Array;
+    contentType: string | null | undefined;
+    version: number;
+    updatedAt: Date | null | undefined;
+  }): ReadKeyResult {
+    return {
+      value: Buffer.from(row.value),
+      contentType: row.contentType ?? null,
+      version: row.version,
+      updatedAt: row.updatedAt ?? null,
+    };
+  }
+
+  /**
+   * Staleness-indicated medium consult for a live row: compare against
+   * the dictionary, and on newer pull boundedly (lock+read) before
+   * serving. Falls back to the row itself on any retryable failure
+   * (stale-acceptable: we hold a value, just possibly not the newest),
+   * with background continuation warming the cache. Terminal version
+   * conflicts fail explicitly even with a row present.
+   */
+  private async consultMedium(
+    spaceId: string,
+    row: {
+      id: string;
+      key: string;
+      value: Buffer | Uint8Array;
+      contentType: string | null | undefined;
+      version: number;
+      updatedAt: Date | null | undefined;
+      lastPersistedVersion: number;
+    },
+  ): Promise<ReadKeyResult> {
+    const key = row.key;
+    let lookup;
     try {
-      envelope = parseBlock(blockRaw).entries[key];
+      lookup = await this.lookupEntry(spaceId, key);
     } catch (error) {
       if (error instanceof StorageVersionError) {
         await this.setSpaceState(spaceId, 'unhealthy');
         throw new ServiceUnavailableException('Stored data uses a newer format version');
       }
+      throw error;
+    }
+    if (lookup.status === 'unknown') return this.toReadResult(row);
+    if (lookup.status === 'absent') {
+      if (row.version !== row.lastPersistedVersion) {
+        // Dirty row the medium never saw: ours, unflushed. Serve it.
+        return this.toReadResult(row);
+      }
+      // Clean row absent from the medium: deleted elsewhere. Pull the
+      // deletion; a concurrent dirtying wins the race instead.
+      const deleted = await this.deleteLocalRow(spaceId, key);
+      if (!deleted) {
+        const current = await this.em.findOne(SpaceKeySchema, { space: spaceId, key });
+        if (!current || current.deletedAt) throw new NotFoundException('Key not found');
+        return this.toReadResult(current);
+      }
+      throw new NotFoundException('Key not found');
+    }
+    if (lookup.keyVersion <= row.version) return this.toReadResult(row);
+    const persistence = this.config.get('persistence', { infer: true });
+    const deadline = Date.now() + persistence.readTimeoutMs;
+    const outcome = await this.raceDeadline(
+      this.sharedBlockRead(spaceId, lookup.blockId, key),
+      deadline,
+    );
+    if (outcome === 'timeout') {
+      this.refreshInBackground(spaceId, lookup.blockId, [key]);
+      return this.toReadResult(row);
+    }
+    if (outcome.status === 'terminal') {
+      await this.setSpaceState(spaceId, 'unhealthy');
+      throw new ServiceUnavailableException('Stored data uses a newer format version');
+    }
+    if (outcome.status !== 'ready') {
+      this.refreshInBackground(spaceId, lookup.blockId, [key]);
+      return this.toReadResult(row);
+    }
+    const envelope = outcome.file.entries[key];
+    if (!envelope || envelope.keyVersion !== lookup.keyVersion) {
+      return this.toReadResult(row);
+    }
+    const { applied } = await this.upsertFromMedium(spaceId, key, {
+      value: Buffer.from(envelope.value, 'base64'),
+      version: envelope.keyVersion,
+      contentType: envelope.contentType,
+    });
+    if (!applied) {
+      const current = await this.em.findOne(SpaceKeySchema, { space: spaceId, key });
+      if (!current || current.deletedAt) throw new NotFoundException('Key not found');
+      return this.toReadResult(current);
+    }
+    return {
+      value: Buffer.from(envelope.value, 'base64'),
+      contentType: envelope.contentType,
+      version: envelope.keyVersion,
+      updatedAt: new Date(envelope.keyVersion),
+    };
+  }
+
+  /**
+   * Read-miss hydration: the key is absent locally but may live on the
+   * medium. Bounded lock+read with retention; 404 only when genuinely
+   * absent, 503 when inconsistent or unreachable (with background
+   * continuation warming the cache for the next read).
+   */
+  private async hydrateFromMedium(spaceId: string, key: string): Promise<ReadKeyResult> {
+    const storage = this.storage;
+    if (!storage) throw new NotFoundException('Key not found');
+    const lookup = await this.lookupEntry(spaceId, key);
+    if (lookup.status !== 'hit') throw new NotFoundException('Key not found');
+    const persistence = this.config.get('persistence', { infer: true });
+    const deadline = Date.now() + persistence.readTimeoutMs;
+    const outcome = await this.raceDeadline(
+      this.sharedBlockRead(spaceId, lookup.blockId, key),
+      deadline,
+    );
+    if (outcome === 'timeout' || outcome.status === 'busy') {
+      this.refreshInBackground(spaceId, lookup.blockId, [key]);
       throw new ServiceUnavailableException('Key data unavailable');
     }
-    if (!envelope || envelope.keyVersion !== entry.keyVersion) {
+    if (outcome.status === 'missing') {
+      throw new ServiceUnavailableException('Key data unavailable');
+    }
+    if (outcome.status === 'terminal') {
+      await this.setSpaceState(spaceId, 'unhealthy');
+      throw new ServiceUnavailableException('Stored data uses a newer format version');
+    }
+    const envelope = outcome.file.entries[key];
+    if (!envelope || envelope.keyVersion !== lookup.keyVersion) {
       throw new ServiceUnavailableException('Key data unavailable');
     }
     const pulled = {
@@ -372,12 +557,7 @@ export class StorageEngineService {
       // A concurrent local write landed meanwhile; serve the newer row.
       const current = await this.em.findOne(SpaceKeySchema, { space: spaceId, key });
       if (!current || current.deletedAt) throw new NotFoundException('Key not found');
-      return {
-        value: Buffer.from(current.value),
-        contentType: current.contentType ?? null,
-        version: current.version,
-        updatedAt: current.updatedAt ?? null,
-      };
+      return this.toReadResult(current);
     }
     return {
       value: pulled.value,
@@ -709,27 +889,378 @@ export class StorageEngineService {
     }
   }
 
+  /**
+   * Best-effort reservation ahead of the flush. Dict-first always: the
+   * dictionary lock precedes every block acquisition so acquisitions are
+   * never spent on stale mappings (wasted acquisitions are the expensive
+   * part on quota-limited media). Pessimistic holds the dict lock across
+   * resolve+acquire; optimistic resolves, acquires, then re-reads to
+   * validate with a single corrected retry. Writes never wait on any of
+   * this — every failure path abandons silently and the flush covers it.
+   */
   private async tryPreLock(spaceId: string, key: string): Promise<void> {
     if (!this.locks) return;
     try {
-      const blockId = await this.locks.locateKeyBlock(spaceId, key);
-      if (!blockId) return;
+      const strategy = await this.strategyFor(spaceId);
+      if (strategy === 'pessimistic') {
+        await this.preLockPessimistic(spaceId, key);
+      } else {
+        await this.preLockOptimistic(spaceId, key);
+      }
+    } catch {
+      // Best-effort: the flush retries the same sequence under its own
+      // locking. A failed pre-lock must never fail the write.
+    }
+  }
+
+  private heldValid(spaceId: string, blockId: string): boolean {
+    const entry = this.preLocks.get(spaceId)?.get(blockId);
+    return !!entry && !needsRenew(entry.acquiredAt, PRE_LOCK_LEASE_MS, Date.now());
+  }
+
+  private recordPreLock(spaceId: string, blockId: string, fence: string): void {
+    let held = this.preLocks.get(spaceId);
+    const prev = held?.get(blockId);
+    if (prev && prev.fence === fence) {
+      // Same-fence re-acquire = renewal: continuity unbroken, the medium
+      // could not have advanced under us. No re-sync needed.
+      prev.acquiredAt = Date.now();
+      return;
+    }
+    if (!held) {
+      held = new Map();
+      this.preLocks.set(spaceId, held);
+    }
+    held.set(blockId, { fence, acquiredAt: Date.now() });
+    // Fresh hold after a possible gap: the medium may have advanced
+    // unseen, so serve-direct stays off until the next reconcile clears it.
+    this.needsResync.add(spaceId);
+  }
+
+  /** Singleflighted dict-lock acquisition shared by concurrent pre-locks. */
+  private acquireDictionary(spaceId: string): Promise<string | null> {
+    // Short-circuit: our own hold is still valid (same clock, exact math —
+    // no medium round-trip). Re-acquisition would only renew anyway.
+    const coveredUntil = this.dictHeldUntil.get(spaceId) ?? 0;
+    if (Date.now() < coveredUntil) return Promise.resolve('held');
+    const running = this.dictAcquiring.get(spaceId);
+    if (running) return running;
+    const attempt = this.doAcquireDictionary(spaceId);
+    this.dictAcquiring.set(spaceId, attempt);
+    void attempt.finally(() => {
+      if (this.dictAcquiring.get(spaceId) === attempt) this.dictAcquiring.delete(spaceId);
+    });
+    return attempt;
+  }
+
+  private async doAcquireDictionary(spaceId: string): Promise<string | null> {
+    if (!this.locks) return null;
+    try {
+      const fence = await this.locks.acquireDictionary(spaceId, this.instanceId, PRELOCK_DICT_LEASE_MS);
+      if (fence) this.dictHeldUntil.set(spaceId, Date.now() + PRELOCK_DICT_LEASE_MS);
+      return fence;
+    } catch {
+      return null;
+    }
+  }
+
+  private async preLockPessimistic(spaceId: string, key: string): Promise<void> {
+    if (!this.locks) return;
+    const dictFence = await this.acquireDictionary(spaceId);
+    if (!dictFence) return;
+    // No explicit dict release: the short lease lapses on its own. Our
+    // own re-entry renews; anyone else waits out at most the remainder.
+    const blockId = await this.locks.locateKeyBlock(spaceId, key);
+    if (!blockId) return;
+    if (this.heldValid(spaceId, blockId)) return;
+    const fence = await this.locks.tryAcquire(
+      spaceId,
+      blockId,
+      this.instanceId,
+      PRE_LOCK_LEASE_MS,
+    );
+    if (!fence) return;
+    this.recordPreLock(spaceId, blockId, fence);
+  }
+
+  private async preLockOptimistic(spaceId: string, key: string): Promise<void> {
+    if (!this.locks) return;
+    const first = await this.locks.locateKeyBlock(spaceId, key);
+    if (!first) return;
+    if (this.heldValid(spaceId, first)) return;
+    const fence = await this.locks.tryAcquire(
+      spaceId,
+      first,
+      this.instanceId,
+      PRE_LOCK_LEASE_MS,
+    );
+    if (!fence) return;
+    // Validate against a fresh mapping (R2): release + single corrected
+    // retry on drift, abandon otherwise. The flush verifies regardless.
+    const confirmed = await this.revalidateMapping(spaceId, key, first);
+    if (confirmed === first) {
+      this.recordPreLock(spaceId, first, fence);
+      return;
+    }
+    await this.locks.release(spaceId, first, this.instanceId).catch(() => undefined);
+    if (confirmed) {
+      try {
+        const fence2 = await this.locks.tryAcquire(
+          spaceId,
+          confirmed,
+          this.instanceId,
+          PRE_LOCK_LEASE_MS,
+        );
+        if (fence2) this.recordPreLock(spaceId, confirmed, fence2);
+      } catch {
+        // Abandon to the flush.
+      }
+    }
+  }
+
+  /**
+   * Fresh mapping check for optimistic validation. Returns the R1 block
+   * when the medium is unreadable (trust R1; the flush verifies), null
+   * when the mapping genuinely vanished (abandon).
+   */
+  private async revalidateMapping(
+    spaceId: string,
+    key: string,
+    resolved: string,
+  ): Promise<string | null> {
+    if (!this.storage) return resolved;
+    try {
+      const raw = await this.storage.read(spaceId, 'dictionary');
+      if (!raw) return null;
+      const fresh = parseDictionary(raw);
+      this.dictionaryCache?.set(spaceId, fresh);
+      return fresh.entries[key]?.blockId ?? null;
+    } catch {
+      return resolved;
+    }
+  }
+
+  /**
+   * Dictionary entry lookup without locks (provisional by design).
+   * `hit` carries the entry; `absent` means a loaded dictionary lacks
+   * the key; `unknown` means no dictionary could be established at all
+   * (no cache, no file, no medium layer) — callers must not confuse
+   * absence with ignorance (Gap-1 deletes only on `absent`).
+   */
+  private async lookupEntry(
+    spaceId: string,
+    key: string,
+  ): Promise<
+    | { status: 'hit'; blockId: string; keyVersion: number }
+    | { status: 'absent' }
+    | { status: 'unknown' }
+  > {
+    const cached = this.dictionaryCache?.get(spaceId);
+    if (cached) {
+      const entry = cached.dictionary.entries[key];
+      return entry ? { status: 'hit', blockId: entry.blockId, keyVersion: entry.keyVersion } : { status: 'absent' };
+    }
+    if (!this.storage) return { status: 'unknown' };
+    let raw: Buffer | null;
+    try {
+      raw = await this.storage.read(spaceId, 'dictionary');
+    } catch {
+      return { status: 'unknown' };
+    }
+    if (!raw) return { status: 'unknown' };
+    try {
+      const fresh = parseDictionary(raw);
+      this.dictionaryCache?.set(spaceId, fresh);
+      const entry = fresh.entries[key];
+      return entry
+        ? { status: 'hit', blockId: entry.blockId, keyVersion: entry.keyVersion }
+        : { status: 'absent' };
+    } catch (error) {
+      if (error instanceof StorageVersionError) throw error;
+      return { status: 'unknown' };
+    }
+  }
+
+  /**
+   * Strategy-dispatched block acquisition shared by pre-lock, reads, and
+   * background refresh. Returns the fencing token and records the hold.
+   * Null when busy, unmapped, or unreachable — never throws for those.
+   */
+  private async acquireBlock(spaceId: string, key: string, blockId: string): Promise<string | null> {
+    if (!this.locks) return null;
+    const strategy = await this.strategyFor(spaceId);
+    if (strategy === 'pessimistic') {
+      const dictFence = await this.acquireDictionary(spaceId);
+      if (!dictFence) return null;
+      const resolved = await this.locks.locateKeyBlock(spaceId, key);
+      if (resolved !== blockId) return null;
       const fence = await this.locks.tryAcquire(
         spaceId,
         blockId,
         this.instanceId,
         PRE_LOCK_LEASE_MS,
       );
-      if (!fence) return;
-      let held = this.preLocks.get(spaceId);
-      if (!held) {
-        held = new Map();
-        this.preLocks.set(spaceId, held);
+      if (!fence) return null;
+      this.recordPreLock(spaceId, blockId, fence);
+      return fence;
+    }
+    const fence = await this.locks.tryAcquire(
+      spaceId,
+      blockId,
+      this.instanceId,
+      PRE_LOCK_LEASE_MS,
+    );
+    if (!fence) return null;
+    const confirmed = await this.revalidateMapping(spaceId, key, blockId);
+    if (confirmed !== blockId) {
+      await this.locks.release(spaceId, blockId, this.instanceId).catch(() => undefined);
+      return null;
+    }
+    this.recordPreLock(spaceId, blockId, fence);
+    return fence;
+  }
+
+  /**
+   * Single shared block read for one key: strategy-dispatched acquire +
+   * read + parse, with the hold recorded for serve-direct. Concurrent
+   * readers of the same block join one attempt.
+   */
+  private sharedBlockRead(
+    spaceId: string,
+    blockId: string,
+    key: string,
+  ): Promise<SharedBlockRead> {
+    const mapKey = `${spaceId}/${blockId}`;
+    const running = this.inflightReads.get(mapKey);
+    if (running) return running;
+    const attempt = this.attemptBlockRead(spaceId, blockId, key);
+    this.inflightReads.set(mapKey, attempt);
+    void attempt.finally(() => {
+      if (this.inflightReads.get(mapKey) === attempt) this.inflightReads.delete(mapKey);
+    });
+    return attempt;
+  }
+
+  private async attemptBlockRead(
+    spaceId: string,
+    blockId: string,
+    key: string,
+  ): Promise<SharedBlockRead> {
+    if (!this.storage) return { status: 'busy' };
+    try {
+      // Without a lock provider there is nothing to acquire: read
+      // directly (version checks downstream still apply).
+      let fence = '';
+      if (this.locks) {
+        const acquired = await this.acquireBlock(spaceId, key, blockId);
+        if (!acquired) return { status: 'busy' };
+        fence = acquired;
       }
-      held.set(blockId, { fence, acquiredAt: Date.now() });
+      const raw = await this.storage.read(spaceId, `blocks/${blockId}`);
+      if (!raw) return { status: 'missing' };
+      try {
+        return { status: 'ready', blockId, fence, file: parseBlock(raw) };
+      } catch (error) {
+        if (error instanceof StorageVersionError) return { status: 'terminal' };
+        return { status: 'missing' };
+      }
     } catch {
-      // Best-effort: the flush retries the same sequence under its own
-      // locking. A failed pre-lock must never fail the write.
+      return { status: 'busy' };
+    }
+  }
+
+  /**
+   * Dictionary entry lookup without locks (provisional by design).
+   * `hit` carries the entry; `absent` means a loaded dictionary lacks
+   * the key (Gap-1 applies); `unknown` means no dictionary could be
+   * established (serve local truth; never delete on ignorance).
+   * Higher format versions propagate (caller marks unhealthy).
+   */
+  private async raceDeadline<T>(
+    promise: Promise<T>,
+    deadline: number,
+  ): Promise<T | 'timeout'> {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return 'timeout';
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<'timeout'>((resolve) => {
+          timer = setTimeout(() => resolve('timeout'), remaining);
+          if (typeof (timer as unknown as { unref?: unknown }).unref === 'function') {
+            (timer as unknown as { unref: () => void }).unref();
+          }
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Background refresh continuation: bounded retry loop over the shared
+   * block read, pulling newer envelopes for the interested keys.
+   * Singleflighted per block; detached from any response; caps bound it;
+   * all errors are logged, never thrown. The next read finds warm cache.
+   */
+  private refreshInBackground(spaceId: string, blockId: string, keys: string[]): void {
+    const mapKey = `bg/${spaceId}/${blockId}`;
+    if (this.bgRefreshInFlight.has(mapKey)) return;
+    const persistence = this.config.get('persistence', { infer: true });
+    const maxAttempts = persistence.backgroundMaxAttempts;
+    const maxElapsedMs = persistence.backgroundMaxElapsedMs;
+    const spacingMs = persistence.readRetrySpacingMs;
+    const startedAt = Date.now();
+    const slot: { current?: Promise<void> } = {};
+    const loop = (async (): Promise<void> => {
+      try {
+        for (let attempts = 0; ; attempts += 1) {
+          if (attempts >= maxAttempts || Date.now() - startedAt > maxElapsedMs) return;
+          if (attempts > 0) await sleep(spacingMs * attempts);
+          let outcome: SharedBlockRead;
+          try {
+            outcome = await this.sharedBlockRead(spaceId, blockId, keys[0] ?? '');
+          } catch {
+            continue;
+          }
+          if (outcome.status === 'terminal') {
+            await this.setSpaceState(spaceId, 'unhealthy').catch(() => undefined);
+            return;
+          }
+          if (outcome.status !== 'ready') continue;
+          await this.pullBlockKeys(spaceId, outcome.file, keys);
+          return;
+        }
+      } finally {
+        if (this.bgRefreshInFlight.get(mapKey) === slot.current) {
+          this.bgRefreshInFlight.delete(mapKey);
+        }
+      }
+    })();
+    slot.current = loop;
+    this.bgRefreshInFlight.set(mapKey, loop);
+    void loop.catch(() => undefined);
+  }
+
+  /** Pull newer envelopes for keys of interest (version-ordered, safe). */
+  private async pullBlockKeys(
+    spaceId: string,
+    file: BlockFile,
+    keys: string[],
+  ): Promise<void> {
+    for (const key of keys) {
+      const envelope = file.entries[key];
+      if (!envelope) continue;
+      try {
+        await this.upsertFromMedium(spaceId, key, {
+          value: Buffer.from(envelope.value, 'base64'),
+          version: envelope.keyVersion,
+          contentType: envelope.contentType,
+        });
+      } catch {
+        continue;
+      }
     }
   }
 }

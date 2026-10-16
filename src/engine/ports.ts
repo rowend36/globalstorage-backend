@@ -19,16 +19,24 @@ export interface FlushHandler {
 }
 
 /**
- * Best-effort block locking for the write-path pre-lock. Locks live on
- * the storage medium (adapter lock resources), so other Global Storage
- * instances can see them. Held pre-locks are consumed by the flush
- * worker, which owns their release.
+ * Locking for paths outside the flush publish (write pre-lock, read
+ * locks). Locks live on the storage medium (adapter lock resources), so
+ * other Global Storage instances can see them. Held pre-locks are
+ * consumed by the flush worker, which adopts them. Dict-first ordering
+ * applies to every acquisition: the dictionary lock is always taken
+ * before resolving and acquiring a block lock, so acquisitions are
+ * never spent on stale mappings.
  */
 export const BLOCK_LOCKS = Symbol('BlockLocks');
 
 export interface BlockLockPort {
   /** Resolve a key to its current block via the dictionary, if known. */
   locateKeyBlock(spaceId: string, key: string): Promise<string | null>;
+  /**
+   * Acquire the dictionary lock (short lease: covers one
+   * resolve-and-acquire round). Returns the fencing token, null when busy.
+   */
+  acquireDictionary(spaceId: string, owner: string, leaseMs: number): Promise<string | null>;
   /**
    * Acquire the block lock. Returns the fencing token on success,
    * null when the block is already locked (caller proceeds anyway).
