@@ -30,7 +30,6 @@ export interface LayoutPlan {
 
 export interface RenderedBlock {
   bytes: Buffer;
-  version: number;
   keyCount: number;
   liveBytes: number;
 }
@@ -189,16 +188,13 @@ export class BlockManager {
     }
     for (const key of delta.removes) delete entries[key];
     for (const row of delta.upserts) entries[row.key] = toBlockEntry(row);
-    const version = (old?.blockVersion ?? 0) + 1;
     const canonical = serializeBlock({
       format: BLOCK_FORMAT,
       blockId: delta.blockId,
-      blockVersion: version,
       entries,
     });
     return {
       bytes: canonical,
-      version,
       keyCount: Object.keys(entries).length,
       liveBytes: canonical.length,
     };
@@ -208,14 +204,13 @@ export class BlockManager {
     previousVersion: number,
     entries: LayoutPlan['entries'],
     rendered: ReadonlyMap<string, RenderedBlock>,
-    previousBlocks: Record<string, { blockVersion: number; keyCount: number; liveBytes: number }>,
+    previousBlocks: Record<string, { keyCount: number; liveBytes: number }>,
   ): Omit<DictionaryFile, 'checksum'> {
-    const blocks: Record<string, { blockVersion: number; keyCount: number; liveBytes: number }> = {
+    const blocks: Record<string, { keyCount: number; liveBytes: number }> = {
       ...previousBlocks,
     };
     for (const [blockId, renderedBlock] of rendered) {
       blocks[blockId] = {
-        blockVersion: renderedBlock.version,
         keyCount: renderedBlock.keyCount,
         liveBytes: renderedBlock.liveBytes,
       };

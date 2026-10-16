@@ -539,7 +539,6 @@ describe('StorageEngineService', () => {
         serializeBlock({
           format: BLOCK_FORMAT,
           blockId,
-          blockVersion: 1,
           entries: {
             [key]: {
               value: Buffer.from(value).toString('base64'),
@@ -556,7 +555,7 @@ describe('StorageEngineService', () => {
           format: DICTIONARY_FORMAT,
           dictionaryVersion: 1,
           entries: { [key]: { blockId, keyVersion: version } },
-          blocks: { [blockId]: { blockVersion: 1, keyCount: 1, liveBytes: 10 } },
+          blocks: { [blockId]: { keyCount: 1, liveBytes: 10 } },
         }),
       );
     };

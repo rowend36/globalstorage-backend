@@ -21,13 +21,12 @@ describe('storage formats', () => {
     const block = {
       format: BLOCK_FORMAT,
       blockId: 'blk_1',
-      blockVersion: 3,
       entries: {
         'todos/1': { value: Buffer.from('x').toString('base64'), keyVersion: 42, contentType: 'application/json', updatedAt: new Date(42).toISOString() },
       },
     };
     const parsed = parseBlock(serializeBlock(block));
-    expect(parsed).toMatchObject({ blockId: 'blk_1', blockVersion: 3 });
+    expect(parsed).toMatchObject({ blockId: 'blk_1' });
     expect(parsed.entries['todos/1'].keyVersion).toBe(42);
     expect(parsed.checksum).toHaveLength(64);
   });
@@ -37,7 +36,7 @@ describe('storage formats', () => {
       ...emptyDictionary(),
       dictionaryVersion: 7,
       entries: { 'a/1': { blockId: 'blk_1', keyVersion: 9 } },
-      blocks: { blk_1: { blockVersion: 2, keyCount: 1, liveBytes: 100 } },
+      blocks: { blk_1: { keyCount: 1, liveBytes: 100 } },
     };
     expect(parseDictionary(serializeDictionary(dictionary)).dictionaryVersion).toBe(7);
     const lock = {
@@ -57,7 +56,7 @@ describe('storage formats', () => {
       ...emptyDictionary(),
       dictionaryVersion: 1,
       entries: { 'a/1': { blockId: 'blk_1', keyVersion: 5 } },
-      blocks: { blk_1: { blockVersion: 1, keyCount: 1, liveBytes: 10 } },
+      blocks: { blk_1: { keyCount: 1, liveBytes: 10 } },
     };
     const once = parseDictionary(serializeDictionary(dictionary));
     delete once.entries['a/1'];
@@ -69,10 +68,9 @@ describe('storage formats', () => {
     const good = JSON.parse(serializeBlock({
       format: BLOCK_FORMAT,
       blockId: 'blk_1',
-      blockVersion: 1,
       entries: {},
     }).toString('utf8')) as Record<string, unknown>;
-    good.blockVersion = 2;
+    good.blockId = 'blk_2';
     expect(() => parseBlock(Buffer.from(JSON.stringify(good)))).toThrow(StorageCorruptError);
   });
 

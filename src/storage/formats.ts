@@ -25,7 +25,6 @@ export interface BlockEntry {
 export interface BlockFile {
   format: string;
   blockId: string;
-  blockVersion: number;
   entries: Record<string, BlockEntry>;
   checksum: string;
 }
@@ -36,7 +35,6 @@ export interface DictionaryEntry {
 }
 
 export interface BlockStats {
-  blockVersion: number;
   keyCount: number;
   liveBytes: number;
 }
@@ -152,7 +150,7 @@ export function serializeBlock(block: Omit<BlockFile, 'checksum'>): Buffer {
 export function parseBlock(data: Buffer): BlockFile {
   const raw = parseJson(data, 'block');
   parseFormat(raw, ['gs-block']);
-  if (typeof raw.blockId !== 'string' || typeof raw.blockVersion !== 'number') {
+  if (typeof raw.blockId !== 'string') {
     throw new StorageCorruptError('block identity invalid');
   }
   if (typeof raw.entries !== 'object' || raw.entries === null) {

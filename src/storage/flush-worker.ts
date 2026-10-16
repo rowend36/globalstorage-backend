@@ -5,7 +5,7 @@ import { StorageEngineService } from '../engine/engine.service';
 import { FlushScheduler } from '../engine/flush-scheduler';
 import type { FlushHandler } from '../engine/ports';
 import type { AppConfig } from '../config/configuration';
-import { BlockManager } from './block-manager';
+import { BlockManager, type RenderedBlock } from './block-manager';
 import { DictionaryCache } from './dictionary-cache';
 import {
   STORAGE_ADAPTER,
@@ -194,10 +194,7 @@ export class FlushWorker implements FlushHandler, OnModuleInit {
         });
       }
 
-      const rendered = new Map<
-        string,
-        { bytes: Buffer; version: number; keyCount: number; liveBytes: number }
-      >();
+      const rendered = new Map<string, RenderedBlock>();
       for (const delta of plan.deltas) {
         if (!(await this.ensureHeld(spaceId, held))) return 'retry';
         const old = await this.readBlockFile(spaceId, delta.blockId);

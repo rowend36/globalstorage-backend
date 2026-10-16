@@ -195,7 +195,6 @@ describe('FlushWorker', () => {
       serializeBlock({
         format: BLOCK_FORMAT,
         blockId: 'blk_x',
-        blockVersion: 1,
         entries: {
           k: {
             value: envelopeValue.toString('base64'),
@@ -213,7 +212,7 @@ describe('FlushWorker', () => {
         format: DICTIONARY_FORMAT,
         dictionaryVersion: 1,
         entries: { k: { blockId: 'blk_x', keyVersion: newer } },
-        blocks: { blk_x: { blockVersion: 1, keyCount: 1, liveBytes: 50 } },
+        blocks: { blk_x: { keyCount: 1, liveBytes: 50 } },
       }),
     );
     await worker.handle([space.id]);

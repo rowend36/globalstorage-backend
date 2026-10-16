@@ -3,14 +3,13 @@ import type { DictionaryFile } from './formats';
 
 export interface CachedDictionary {
   dictionary: DictionaryFile;
-  blockVersions: Map<string, number>;
 }
 
 /**
  * In-memory dictionary cache per space. Advisory only: the medium is the
  * source of truth, and every flush re-reads under the held dict lock.
- * Stored alongside are the last-seen block versions that drive the
- * reconcile fast path (only changed blocks are descended into).
+ * Reconcile compares per-key versions directly — no baseline state is
+ * kept here, so a cached copy can never suppress a needed sync.
  */
 @Injectable()
 export class DictionaryCache {
@@ -21,15 +20,7 @@ export class DictionaryCache {
   }
 
   set(spaceId: string, dictionary: DictionaryFile): void {
-    this.cache.set(spaceId, {
-      dictionary,
-      blockVersions: new Map(
-        Object.entries(dictionary.blocks).map(([blockId, stats]) => [
-          blockId,
-          stats.blockVersion,
-        ]),
-      ),
-    });
+    this.cache.set(spaceId, { dictionary });
   }
 
   invalidate(spaceId: string): void {

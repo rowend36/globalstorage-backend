@@ -66,7 +66,7 @@ describe('MediumLockService', () => {
       ...emptyDictionary(),
       dictionaryVersion: 3,
       entries: { 'a/1': { blockId: 'blk_9', keyVersion: 12 } },
-      blocks: { blk_9: { blockVersion: 1, keyCount: 1, liveBytes: 10 } },
+      blocks: { blk_9: { keyCount: 1, liveBytes: 10 } },
     };
     await adapter.write('sp_1', 'dictionary', serializeDictionary(dictionary));
     expect(await locks.locateKeyBlock('sp_1', 'a/1')).toBe('blk_9');

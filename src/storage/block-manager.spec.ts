@@ -23,7 +23,7 @@ const currentDict = (entries: Record<string, { blockId: string; keyVersion: numb
     dictionaryVersion: 4,
     entries,
     blocks: {
-      blk_1: { blockVersion: 2, keyCount: 2, liveBytes: 300 },
+      blk_1: { keyCount: 2, liveBytes: 300 },
     },
     checksum: 'test-only',
   }) as DictionaryFile;
@@ -38,7 +38,6 @@ describe('BlockManager', () => {
     expect(plan.deleteBlocks).toEqual([]);
     expect(Object.keys(plan.entries)).toEqual(['a', 'b']);
     const rendered = manager.renderBlock(plan.deltas[0], null, new Map());
-    expect(rendered.version).toBe(1);
     expect(rendered.keyCount).toBe(2);
     expect(parseBlock(rendered.bytes).entries['a'].keyVersion).toBe(100);
   });
@@ -107,7 +106,6 @@ describe('BlockManager', () => {
     const old = {
       format: 'gs-block/1',
       blockId: 'blk_1',
-      blockVersion: 2,
       entries: {
         keep: { value: Buffer.from('keep').toString('base64'), keyVersion: 50, contentType: null, updatedAt: new Date(50).toISOString() },
         gone: { value: Buffer.from('gone').toString('base64'), keyVersion: 51, contentType: null, updatedAt: new Date(51).toISOString() },
@@ -121,7 +119,7 @@ describe('BlockManager', () => {
     );
     const parsed = parseBlock(rendered.bytes);
     expect(Object.keys(parsed.entries).sort()).toEqual(['keep', 'new']);
-    expect(parsed.blockVersion).toBe(3);
+    expect(parsed.entries['new'].keyVersion).toBe(200);
     expect(rendered.keyCount).toBe(2);
     expect(rendered.liveBytes).toBe(rendered.bytes.length);
   });
@@ -130,11 +128,11 @@ describe('BlockManager', () => {
     const dictionary = manager.buildDictionary(
       4,
       { 'a/1': { blockId: 'blk_1', keyVersion: 200 } },
-      new Map([['blk_1', { bytes: Buffer.alloc(10), version: 3, keyCount: 1, liveBytes: 10 }]]),
-      { blk_0: { blockVersion: 1, keyCount: 0, liveBytes: 0 } },
+      new Map([['blk_1', { bytes: Buffer.alloc(10), keyCount: 1, liveBytes: 10 }]]),
+      { blk_0: { keyCount: 0, liveBytes: 0 } },
     );
     expect(dictionary.dictionaryVersion).toBe(5);
-    expect(dictionary.blocks['blk_1']).toEqual({ blockVersion: 3, keyCount: 1, liveBytes: 10 });
-    expect(dictionary.blocks['blk_0'].blockVersion).toBe(1);
+    expect(dictionary.blocks['blk_1']).toEqual({ keyCount: 1, liveBytes: 10 });
+    expect(dictionary.blocks['blk_0']).toEqual({ keyCount: 0, liveBytes: 0 });
   });
 });
