@@ -79,9 +79,10 @@ export interface WriteKeyInput {
   /**
    * Optimistic-concurrency precondition: undefined = unconditional,
    * null = create-only (key must not exist), number = current live
-   * version must equal this timestamp.
+   * version must equal this timestamp, 'exists' = key must exist
+   * (update-only, any version).
    */
-  expectedVersion?: number | null;
+  expectedVersion?: number | null | 'exists';
 }
 
 export interface WriteKeyResult {
@@ -340,7 +341,14 @@ export class StorageEngineService {
       if (input.expectedVersion === null && live) {
         throw new KeyVersionConflictException(live.version);
       }
-      if (input.expectedVersion !== undefined && input.expectedVersion !== null) {
+      if (input.expectedVersion === 'exists' && !live) {
+        throw new KeyVersionConflictException(null);
+      }
+      if (
+        input.expectedVersion !== undefined &&
+        input.expectedVersion !== null &&
+        input.expectedVersion !== 'exists'
+      ) {
         if (!live || live.version !== input.expectedVersion) {
           throw new KeyVersionConflictException(live?.version ?? null);
         }

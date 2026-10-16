@@ -59,7 +59,7 @@ const MAX_CONTENT_TYPE_LENGTH = 255;
 function parsePreconditions(
   ifMatch: string | undefined,
   ifNoneMatch: string | undefined,
-): number | null | undefined {
+): number | null | 'exists' | undefined {
   if (ifNoneMatch !== undefined) {
     if (ifNoneMatch.trim() !== '*') {
       throw new BadRequestException('Only If-None-Match: * is supported');
@@ -70,9 +70,10 @@ function parsePreconditions(
     return null;
   }
   if (ifMatch === undefined) return undefined;
+  if (ifMatch.trim() === '*') return 'exists';
   const version = Number(ifMatch);
   if (!Number.isInteger(version) || version < 0) {
-    throw new BadRequestException('If-Match must carry a key version timestamp');
+    throw new BadRequestException('If-Match must carry a key version timestamp or *');
   }
   return version;
 }

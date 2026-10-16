@@ -196,6 +196,35 @@ describe('StorageEngineService', () => {
     ).rejects.toMatchObject({ status: 412 });
   });
 
+  it('supports must-exist preconditions', async () => {
+    const space = await service.createSpace(ownerId, 'MustExist');
+    await expect(
+      service.writeKey({
+        ownerId,
+        spaceId: space.id,
+        key: 'missing',
+        value: Buffer.from('x'),
+        expectedVersion: 'exists',
+      }),
+    ).rejects.toMatchObject({ status: 412 });
+    const created = await service.writeKey({
+      ownerId,
+      spaceId: space.id,
+      key: 'present',
+      value: Buffer.from('x'),
+    });
+    const updated = await service.writeKey({
+      ownerId,
+      spaceId: space.id,
+      key: 'present',
+      value: Buffer.from('y'),
+      expectedVersion: 'exists',
+    });
+    expect(updated.version).toBeGreaterThan(created.version);
+    const read = await service.readKey({ ownerId, spaceId: space.id, key: 'present' });
+    expect(read.value.toString()).toBe('y');
+  });
+
   it('tombstones deletes and revives on rewrite', async () => {
     const space = await service.createSpace(ownerId, 'Delete');
     const written = await service.writeKey({

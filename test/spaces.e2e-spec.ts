@@ -121,6 +121,20 @@ describe('spaces and keys (e2e)', () => {
         .set('if-none-match', '*')
         .send('created'),
     ).expect(200);
+    await auth(
+      request(app.getHttpServer())
+        .put(`/v1/spaces/${spaceId}/keys/${encodeURIComponent('never/existed')}`)
+        .set('content-type', 'text/plain')
+        .set('if-match', '*')
+        .send('x'),
+    ).expect(412);
+    await auth(
+      request(app.getHttpServer())
+        .put(`/v1/spaces/${spaceId}/keys/${encodeURIComponent('brand/new')}`)
+        .set('content-type', 'text/plain')
+        .set('if-match', '*')
+        .send('updated'),
+    ).expect(200);
   });
 
   it('lists keys with prefix and pagination', async () => {
