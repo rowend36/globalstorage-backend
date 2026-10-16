@@ -26,6 +26,7 @@ import {
 import { OidcModule } from './oidc/oidc.module';
 import { JobsModule } from './jobs/jobs.module';
 import { EngineModule } from './engine/engine.module';
+import { SpacesModule } from './spaces/spaces.module';
 import { LoggerModule } from 'nestjs-pino';
 import pino, { type TransportTargetOptions } from 'pino';
 import { join } from 'node:path';
@@ -168,6 +169,7 @@ LoggerModule.forRootAsync({
     JobsModule.register(),
     ObservabilityModule,
     EngineModule,
+    SpacesModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })

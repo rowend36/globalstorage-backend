@@ -312,6 +312,19 @@ export class StorageEngineService {
     return space ? this.toSpaceSummary(space) : null;
   }
 
+  async getSpaceSummary(ownerId: string, spaceId: string): Promise<SpaceSummary> {
+    return this.toSpaceSummary(await this.loadSpace(ownerId, spaceId));
+  }
+
+  async listSpaces(ownerId: string): Promise<SpaceSummary[]> {
+    const rows = await this.em.find(
+      SpaceSchema,
+      { owner: ownerId },
+      { orderBy: { createdAt: 'ASC' } },
+    );
+    return rows.map((space) => this.toSpaceSummary(space));
+  }
+
   // ------------------------------------------------------------------ keys
 
   async writeKey(input: WriteKeyInput): Promise<WriteKeyResult> {

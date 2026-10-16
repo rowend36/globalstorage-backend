@@ -7,6 +7,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import type { Request, Response, NextFunction } from 'express';
+import { raw } from 'express';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 import { AppConfig } from './config/configuration';
@@ -31,6 +32,18 @@ export function configureApplication(app: INestApplication): void {
 
   app.use(helmet());
   app.use(cookieParser());
+
+  // Raw value bodies for key writes. Registered here (before Nest's body
+  // parsers are installed at init) so PUT .../keys/* arrives as a Buffer
+  // regardless of content type — byte-exactness for arbitrary values.
+  // body-parser skips already-consumed requests downstream via req._body.
+  app.use((request: Request, response: Response, next: NextFunction) => {
+    if (request.method === 'PUT' && request.path.includes('/keys/')) {
+      raw({ type: () => true, limit: '11mb' })(request, response, next);
+    } else {
+      next();
+    }
+  });
 
   app.use((request: Request, response: Response, next: NextFunction) => {
     requestContext.run(() => {
