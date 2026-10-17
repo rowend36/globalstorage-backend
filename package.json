@@ -109,6 +109,7 @@
     "@types/nodemailer": "^8.0.1",
     "@types/passport-jwt": "^4.0.1",
     "@types/supertest": "^7.0.0",
+    "chokidar": "^5.0.0",
     "cross-env": "^10.1.0",
     "jest": "^30.0.0",
     "oxlint": "^1.80.0",
