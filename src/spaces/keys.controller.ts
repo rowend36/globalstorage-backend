@@ -56,6 +56,15 @@ class ListKeysResponse {
 
 const MAX_CONTENT_TYPE_LENGTH = 255;
 
+/**
+ * Express 5 wildcard params arrive as an array of decoded path segments.
+ * Join with '/' so `todos%2F123` and `todos/123` both yield the logical key
+ * `todos/123`.
+ */
+function normalizeKeyParam(raw: string | string[]): string {
+  return Array.isArray(raw) ? raw.join('/') : raw;
+}
+
 function parsePreconditions(
   ifMatch: string | undefined,
   ifNoneMatch: string | undefined,
@@ -135,10 +144,11 @@ export class KeysController {
   async write(
     @Req() request: Request & { user: CurrentUser } & { body?: unknown },
     @Param('spaceId') spaceId: string,
-    @Param('key') key: string,
+    @Param('key') rawKey: string | string[],
     @Headers('if-match') ifMatch?: string,
     @Headers('if-none-match') ifNoneMatch?: string,
   ): Promise<WriteKeyResponse> {
+    const key = normalizeKeyParam(rawKey);
     const value = rawBodyBytes(request.body, request);
     const contentTypeHeader = request.get('content-type');
     const contentType = contentTypeHeader?.split(';')[0]?.trim() || null;
@@ -161,9 +171,10 @@ export class KeysController {
   async read(
     @Req() request: Request & { user: CurrentUser },
     @Param('spaceId') spaceId: string,
-    @Param('key') key: string,
+    @Param('key') rawKey: string | string[],
     @Res({ passthrough: true }) response: Response,
   ): Promise<void> {
+    const key = normalizeKeyParam(rawKey);
     const result = await this.engine.readKey({
       ownerId: request.user.sub,
       spaceId,
@@ -184,8 +195,12 @@ export class KeysController {
   async remove(
     @Req() request: Request & { user: CurrentUser },
     @Param('spaceId') spaceId: string,
-    @Param('key') key: string,
+    @Param('key') rawKey: string | string[],
   ): Promise<DeleteKeyResponse> {
-    return this.engine.deleteKey({ ownerId: request.user.sub, spaceId, key });
+    return this.engine.deleteKey({
+      ownerId: request.user.sub,
+      spaceId,
+      key: normalizeKeyParam(rawKey),
+    });
   }
 }

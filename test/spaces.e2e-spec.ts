@@ -235,6 +235,36 @@ describe('spaces and keys (e2e)', () => {
     await auth(request(app.getHttpServer()).get(`/v1/spaces/${spaceId}`)).expect(404);
   });
 
+  it('treats nested slash paths and %2F keys as the same logical key', async () => {
+    const space = await auth(
+      request(app.getHttpServer()).post('/v1/spaces').send({ name: 'Slash Paths' }),
+    ).expect(201);
+    const scopedId = space.body.id;
+
+    const put = await auth(
+      request(app.getHttpServer())
+        .put(`/v1/spaces/${scopedId}/keys/deep/nested`)
+        .set('content-type', 'text/plain')
+        .send('slash value'),
+    ).expect(200);
+    expect(put.body.key).toBe('deep/nested');
+
+    const aliased = await auth(
+      request(app.getHttpServer()).get(
+        `/v1/spaces/${scopedId}/keys/${encodeURIComponent('deep/nested')}`,
+      ),
+    ).expect(200);
+    expect(aliased.text).toBe('slash value');
+    expect(aliased.headers['x-key-version']).toBe(String(put.body.version));
+
+    const deleted = await auth(
+      request(app.getHttpServer()).delete(
+        `/v1/spaces/${scopedId}/keys/${encodeURIComponent('deep/nested')}`,
+      ),
+    ).expect(200);
+    expect(deleted.body.key).toBe('deep/nested');
+  });
+
   it('requires authentication', async () => {
     await request(app.getHttpServer()).get('/v1/spaces').expect(401);
   });
