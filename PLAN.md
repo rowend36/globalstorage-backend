@@ -463,17 +463,31 @@ flush fast path (skip dict when all held + no structural need);
 reconcile ChangeEvents. Done already: `getKeyEntries`, requeue,
 per-process owner ids, dict-free renewal.
 
-### Phase 4 — API (spec §5.1 exactly)
+### Phase 4 — API (spec §5.1 exactly) (DONE, committed)
 `GET/POST /v1/spaces`, `GET/PATCH/DELETE /v1/spaces/{id}`,
 `GET/PUT/DELETE /v1/spaces/{id}/keys/{key}` (wildcard),
 `GET /v1/spaces/{id}/keys`, `GET /v1/spaces/{id}/status`.
 Precise key encoding, pagination, request size limits
 (10 MB max value), error format.
+Commits: `efabbc1` spaces + keys controllers (with raw-body
+middleware in `bootstrap.ts`), `5bf3ce4` If-Match: * update-only,
+`5b97878` Express 5 wildcard param normalization (see below).
 
-### Phase 5 — Frontend
+Wildcards: Express 5 captures `*key` as an array of decoded segments —
+normalized with `/`.join so `todos%2F123` and `todos/123` are the same
+logical key (e2e regression test included; the unit-name drift was found
+by live smoke testing, since PUT/GET co-erced and e2e used `%2F` only).
+
+### Phase 5 — Frontend (DONE, committed)
 Scaffold (RRv7 + Vite + Tailwind v4 + shadcn, TanStack Query,
 `VITE_PUBLIC_API_URL`): landing page; dashboard with auth, spaces
 list + usage, full key browse/read/write.
+Commit: `d2520b5` (frontend repo `~/Work/globalstorage-frontend`).
+Gates: `tsc -b` clean, `vite build` clean, oxlint 3 non-blocking
+warnings. Live: server on :5180, CORS preflight 204 from the backend,
+full smoke (register → space → write/read/prefix-list/status/
+conditional write → delete) passing against the fixed wildcard
+contract.
 
 ### Phase 6 — Verification
 All gates, end-to-end register→space→write→read→status flow against
